@@ -97,7 +97,7 @@ pub enum CaptureState {
 }
 
 impl CaptureState {
-    fn to_u8(self) -> u8 {
+    pub(crate) fn to_u8(self) -> u8 {
         match self {
             CaptureState::Idle => 0,
             CaptureState::Connecting => 1,
@@ -107,7 +107,7 @@ impl CaptureState {
         }
     }
 
-    fn from_u8(v: u8) -> Self {
+    pub(crate) fn from_u8(v: u8) -> Self {
         match v {
             1 => CaptureState::Connecting,
             2 => CaptureState::Streaming,
@@ -460,7 +460,7 @@ fn process(stream: &pw::stream::Stream, acc: &mut Accum) {
 /// What `PipeWireSource::stop` returns: a panicked supervisor first, then a stream that never
 /// reached `Idle` inside the timeout (its real-time callback may still be running).
 /// `final_state` is `None` when no Close was sent, i.e. there was nothing to wait for.
-fn stop_result(
+pub(crate) fn stop_result(
     panicked: bool,
     final_state: Option<CaptureState>,
     timeout: Duration,
@@ -676,7 +676,7 @@ pub(crate) fn enum_format_pod(rate: u32) -> Result<Vec<u8>, String> {
 /// crate has no safe wrapper for it, and a retarget needs it: the stream (and with it the
 /// listener that owns the `FrameSink`) must survive, only its target changes.
 #[allow(unsafe_code)] // CLAUDE.md allows unsafe in dmn-audio; this is its only use.
-fn update_stream_props(
+pub(crate) fn update_stream_props(
     stream: &pw::stream::Stream,
     entries: &[(&std::ffi::CStr, Option<&std::ffi::CStr>)],
 ) -> Result<(), String> {

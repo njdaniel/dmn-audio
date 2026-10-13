@@ -11,7 +11,7 @@ This crate was written inside [`njdaniel/daemon`](https://github.com/njdaniel/da
 Two things follow from that, until they are tidied up:
 
 - Issue and pull-request numbers in comments (`#108`, `PR #25`) and references to `docs/SPEC.md` point at `daemon`, not at this repository.
-- The API still speaks `daemon`'s language in places: sources are labelled `You` and `Interviewer`, capture delivers 16 kHz mono in 20 ms frames, and the only output is the virtual microphone.
+- The API still speaks `daemon`'s language in places: sources are labelled `You` and `Interviewer`, `PipeWireSource` delivers 16 kHz mono in 20 ms frames (`MicCapture` delivers a microphone at a rate you choose, as plain samples in a ring), and the only output is the virtual microphone.
 
 ## Requirements
 
@@ -40,7 +40,7 @@ cargo test                 # needs no PipeWire session and no audio device
 cargo test -- --ignored    # the live tests: need a running PipeWire session
 ```
 
-The live tests need `pw-play` and `pw-record` on the PATH. They create and remove their own nodes in the PipeWire graph, and some play a quiet 440 Hz tone through the default output for a couple of seconds, so you will hear them. Run them on a development machine, not in CI.
+The live tests need `pw-play`, `pw-record` and `pw-loopback` on the PATH. They create and remove their own nodes in the PipeWire graph. The older ones play a quiet 440 Hz tone through the default output for a couple of seconds, so you will hear them; the `MicCapture` ones make their own virtual source and are silent. Run them on a development machine, not in CI.
 
 `cargo run -p dmn-audio --example hotplug` is a manual check of the device table: start and stop `pw-play` in another terminal and watch it follow.
 

@@ -31,6 +31,7 @@ use pw::types::ObjectType;
 
 use crate::capture::{LoopCapture, OpenSpec};
 use crate::frames::FrameSink;
+use crate::mic::{LoopMic, MicSpec, MicWriter};
 use crate::vmic::{LoopVmic, Mixer, VmicSpec};
 
 #[derive(Debug, thiserror::Error)]
@@ -316,6 +317,13 @@ pub(crate) enum Command {
         spec: OpenSpec,
         sink: FrameSink,
     },
+    /// Create a microphone capture stream (not connected yet) under `key`. Connect, Disconnect
+    /// and Close then reach it by the same key as any other capture stream.
+    OpenMic {
+        key: u64,
+        spec: MicSpec,
+        writer: MicWriter,
+    },
     /// Retarget and (re)connect the stream under `key`.
     Connect {
         key: u64,
@@ -485,7 +493,9 @@ fn loop_thread(
     // microphone opens and closes its playback stream the same way.
     let captures: Rc<RefCell<HashMap<u64, LoopCapture>>> = Rc::new(RefCell::new(HashMap::new()));
     let vmics: Rc<RefCell<HashMap<u64, LoopVmic>>> = Rc::new(RefCell::new(HashMap::new()));
+    let mics: Rc<RefCell<HashMap<u64, LoopMic>>> = Rc::new(RefCell::new(HashMap::new()));
     let cmd_captures = Rc::clone(&captures);
+    let cmd_mics = Rc::clone(&mics);
     let cmd_vmics = Rc::clone(&vmics);
     let cmd_core = core.clone();
     let loop_weak = main_loop.downgrade();
@@ -504,6 +514,15 @@ fn loop_thread(
                 Err(e) => status.set_error(e),
             }
         }
+        Command::OpenMic { key, spec, writer } => {
+            let status = Arc::clone(&spec.status);
+            match LoopMic::open(&cmd_core, spec, writer) {
+                Ok(m) => {
+                    cmd_mics.borrow_mut().insert(key, m);
+                }
+                Err(e) => status.set_error(e),
+            }
+        }
         Command::Connect {
             key,
             target_object,
@@ -511,16 +530,27 @@ fn loop_thread(
         } => {
             if let Some(c) = cmd_captures.borrow_mut().get_mut(&key) {
                 c.connect(target_object.as_deref(), capture_sink);
+            } else if let Some(m) = cmd_mics.borrow_mut().get_mut(&key) {
+                m.connect(target_object.as_deref());
             }
         }
         Command::Disconnect { key } => {
             if let Some(c) = cmd_captures.borrow_mut().get_mut(&key) {
                 c.disconnect();
+            } else if let Some(m) = cmd_mics.borrow_mut().get_mut(&key) {
+                m.disconnect();
             }
         }
         Command::Close { key } => {
             let closed = cmd_captures.borrow_mut().remove(&key);
+            // Keys are unique across both maps; the borrow ends before the stream is dropped.
+            let closed_mic = if closed.is_none() {
+                cmd_mics.borrow_mut().remove(&key)
+            } else {
+                None
+            };
             drop(closed);
+            drop(closed_mic);
         }
         Command::OpenVmic { key, spec, mixer } => {
             let status = Arc::clone(&spec.status);
@@ -682,6 +712,7 @@ fn loop_thread(
     // its node out of the graph), then listeners before proxies before the core: drop in
     // reverse creation order.
     captures.borrow_mut().clear();
+    mics.borrow_mut().clear();
     vmics.borrow_mut().clear();
     drop(_commands);
     drop(_registry_listener);
