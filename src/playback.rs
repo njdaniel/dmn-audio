@@ -1526,9 +1526,12 @@ mod tests {
         /// and `pw-metadata`. It checks that a stream playing to "the default" is moved by the
         /// session manager when the default changes, without being reopened.
         ///
-        /// Not run when it was written (it needs the default sink changed on a machine in
-        /// use), so whether writing `default.audio.sink` moves the default on a given session
-        /// manager is itself something the first run of this test finds out.
+        /// First run on 2026-10-13, PipeWire 1.6.8 with WirePlumber 0.5.12: it passes, the
+        /// stream follows the default from the first sink to the second, and the default it
+        /// found is back afterwards. Writing `default.audio.sink` is what moves the default
+        /// there; another session manager may want it done differently. That run also showed a
+        /// short burst above the written level when sound begins on a default-routed stream,
+        /// which this test does not assert on yet (issue #5).
         #[test]
         #[ignore = "CHANGES THE DEFAULT SINK while it runs (to its own virtual sinks, then back); needs PipeWire, pw-loopback, pw-link and pw-metadata"]
         fn live_playback_to_the_default_sink_follows_it_when_the_default_changes() {
