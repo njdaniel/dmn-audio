@@ -1,0 +1,28 @@
+[package]
+name = "dmn-audio"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/njdaniel/dmn-audio"
+rust-version = "1.85"
+description = "PipeWire audio capture with hot-plug re-attach, WAV replay, and a virtual microphone, behind lock-free rings"
+
+[dependencies]
+hound = "3.5"
+# v0_3_49: `Buffer::requested`, how many frames the graph wants from the virtual microphone's
+# playback callback each cycle (#108). A version gate on the installed libpipewire (≥ 0.3.49;
+# Ubuntu 24.04 ships 1.0), not a new crate.
+pipewire = { version = "0.10", features = ["v0_3_49"] }
+ringbuf = "0.5"
+rubato = "5"
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints.rust]
+unsafe_code = "warn"
+
+[lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
