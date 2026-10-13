@@ -1488,93 +1488,143 @@ mod tests {
             mic.stop().unwrap();
         }
 
-        /// Needs a running PipeWire session. PLAYS TO THE DEFAULT SINK, so it is audible (a
-        /// quiet tone for about a second) and it CHANGES THE DEFAULT SINK to a null sink of its
-        /// own, and back (restored on every exit path). Run it on a
-        /// development machine with nobody listening.
+        /// Sets the `default.audio.sink` metadata entry, or deletes it for `None`.
+        fn set_default_sink(to: Option<&str>) {
+            let mut cmd = Proc::new("pw-metadata");
+            match to {
+                Some(name) => cmd.args([
+                    "0",
+                    "default.audio.sink",
+                    &format!("{{ \"name\": \"{name}\" }}"),
+                    "Spa:String:JSON",
+                ]),
+                None => cmd.args(["-d", "0", "default.audio.sink"]),
+            };
+            let out = cmd.output().expect("pw-metadata on PATH");
+            assert!(out.status.success(), "pw-metadata failed");
+        }
+
+        /// Wait until the playback stream is linked to `sink` and to nothing else.
+        fn wait_linked_only_to(sink: &str) {
+            wait_for(
+                "the stream to be on the sink",
+                Duration::from_secs(5),
+                || {
+                    let links = linked_from(PLAYBACK_NODE_NAME);
+                    !links.is_empty() && links.iter().all(|l| l.starts_with(&format!("{sink}:")))
+                },
+            );
+        }
+
+        /// CHANGES THE SESSION'S DEFAULT SINK while it runs, to two virtual sinks of its own in
+        /// turn, and puts back what it found on every exit path. Everything else playing on the
+        /// machine moves with the default, so it goes quiet for those seconds: run it on a
+        /// development machine with nothing playing. The test itself is silent: it writes no
+        /// sample until the stream is linked to one of its own sinks and to nothing else.
+        ///
+        /// Needs a running PipeWire session with a session manager, `pw-loopback`, `pw-link`
+        /// and `pw-metadata`. It checks that a stream playing to "the default" is moved by the
+        /// session manager when the default changes, without being reopened.
+        ///
+        /// Not run when it was written (it needs the default sink changed on a machine in
+        /// use), so whether writing `default.audio.sink` moves the default on a given session
+        /// manager is itself something the first run of this test finds out.
         #[test]
-        #[ignore = "needs PipeWire, pw-loopback, pw-link and pw-metadata; plays to the default sink and switches the default sink (twice) to a virtual one"]
+        #[ignore = "CHANGES THE DEFAULT SINK while it runs (to its own virtual sinks, then back); needs PipeWire, pw-loopback, pw-link and pw-metadata"]
         fn live_playback_to_the_default_sink_follows_it_when_the_default_changes() {
-            let name = format!("dmn-test-follow-{}", std::process::id());
-            let sink_name = format!("{name}-sink");
+            let pid = std::process::id();
+            let (a, b) = (
+                format!("dmn-test-follow-a-{pid}"),
+                format!("dmn-test-follow-b-{pid}"),
+            );
+            let (a_sink, b_sink) = (format!("{a}-sink"), format!("{b}-sink"));
             let ctx = Arc::new(PipeWireContext::connect().expect("PipeWire running"));
             assert!(ctx.wait_for_sync(Duration::from_secs(2)).synced);
-            let original = ctx
-                .nodes()
-                .default_sink
-                .expect("a default sink to restore afterwards");
 
-            /// Puts the default sink back on every exit path.
-            struct Restore(String);
-            impl Drop for Restore {
-                fn drop(&mut self) {
-                    let _ = Proc::new("pw-metadata")
-                        .args([
-                            "0",
-                            "default.audio.sink",
-                            &format!("{{ \"name\": \"{}\" }}", self.0),
-                            "Spa:String:JSON",
-                        ])
-                        .output();
-                }
-            }
-            let _restore = Restore(original.clone());
-
-            let _loop = Loopback::new(&name);
+            let _first = Loopback::new(&a);
+            let _second = Loopback::new(&b);
             wait_for(
-                "sink and source in the table",
+                "both virtual sinks in the table",
                 Duration::from_secs(3),
                 || {
                     let t = ctx.nodes();
-                    t.sinks().any(|n| n.name == sink_name) && t.sources().any(|n| n.name == name)
+                    [&a_sink, &b_sink]
+                        .iter()
+                        .all(|s| t.sinks().any(|n| &n.name == *s))
+                        && [&a, &b].iter().all(|s| t.sources().any(|n| &n.name == *s))
                 },
             );
-            let mut mic = MicCapture::new(
-                Arc::clone(&ctx),
-                CaptureTarget::Mic(Some(name.clone())),
-                48_000,
-                2_000,
-            )
-            .unwrap();
-            let mut heard_by = mic.start().unwrap();
-            mic.wait_streaming(Duration::from_secs(3)).unwrap();
 
+            /// Puts the default sink back as it was found, on every exit path. Declared after
+            /// the loopbacks so that it runs before they go.
+            struct Restore(Option<String>);
+            impl Drop for Restore {
+                fn drop(&mut self) {
+                    let mut cmd = Proc::new("pw-metadata");
+                    match &self.0 {
+                        Some(name) => cmd.args([
+                            "0",
+                            "default.audio.sink",
+                            &format!("{{ \"name\": \"{name}\" }}"),
+                            "Spa:String:JSON",
+                        ]),
+                        None => cmd.args(["-d", "0", "default.audio.sink"]),
+                    };
+                    let _ = cmd.output();
+                }
+            }
+            let _restore = Restore(ctx.nodes().default_sink);
+
+            let record = |name: &str| {
+                let mut mic = MicCapture::new(
+                    Arc::clone(&ctx),
+                    CaptureTarget::Mic(Some(name.to_owned())),
+                    48_000,
+                    2_000,
+                )
+                .unwrap();
+                let reader = mic.start().unwrap();
+                mic.wait_streaming(Duration::from_secs(3)).unwrap();
+                (mic, reader)
+            };
+            let (mut mic_a, mut heard_on_a) = record(&a);
+            let (mut mic_b, mut heard_on_b) = record(&b);
+
+            // The default is the first virtual sink before the stream exists, so the stream is
+            // never linked to a real device.
+            set_default_sink(Some(&a_sink));
+            wait_for(
+                "the default to be the first sink",
+                Duration::from_secs(3),
+                || ctx.nodes().default_sink.as_deref() == Some(a_sink.as_str()),
+            );
             let mut play =
                 Playback::new(Arc::clone(&ctx), SinkTarget::Default, 48_000, 2_000).unwrap();
             let st = play.status();
             let mut writer = play.start().unwrap();
             play.wait_streaming(Duration::from_secs(3)).unwrap();
+            wait_linked_only_to(&a_sink);
+            let heard = play_and_record(&mut writer, &mut heard_on_a, 48_000, 1.0);
+            assert_tone(&heard, 48_000, "on the first default");
 
-            // Move the default to the virtual sink: the stream follows without being reopened.
-            let set_default = |to: &str| {
-                let out = Proc::new("pw-metadata")
-                    .args([
-                        "0",
-                        "default.audio.sink",
-                        &format!("{{ \"name\": \"{to}\" }}"),
-                        "Spa:String:JSON",
-                    ])
-                    .output()
-                    .expect("pw-metadata");
-                assert!(out.status.success());
-            };
-            set_default(&sink_name);
-            wait_for("default moved", Duration::from_secs(3), || {
-                ctx.nodes().default_sink.as_deref() == Some(sink_name.as_str())
+            // Move the default: the stream follows without being reopened.
+            set_default_sink(Some(&b_sink));
+            wait_for(
+                "the default to be the second sink",
+                Duration::from_secs(3),
+                || ctx.nodes().default_sink.as_deref() == Some(b_sink.as_str()),
+            );
+            wait_linked_only_to(&b_sink);
+            wait_for("playing again", Duration::from_secs(5), || {
+                st.state() == CaptureState::Streaming && st.playing_rate().is_some()
             });
-            wait_for("stream moved", Duration::from_secs(5), || {
-                linked_from(PLAYBACK_NODE_NAME)
-                    .iter()
-                    .all(|l| l.starts_with(&format!("{sink_name}:")))
-                    && !linked_from(PLAYBACK_NODE_NAME).is_empty()
-            });
-            let heard = play_and_record(&mut writer, &mut heard_by, 48_000, 1.0);
+            let _ = heard_on_b.pop(&mut [0.0; 48_000]);
+            let heard = play_and_record(&mut writer, &mut heard_on_b, 48_000, 1.0);
             assert_tone(&heard, 48_000, "after the default moved");
-            assert_eq!(st.state(), CaptureState::Streaming);
 
-            set_default(&original);
             play.stop().unwrap();
-            mic.stop().unwrap();
+            mic_a.stop().unwrap();
+            mic_b.stop().unwrap();
         }
     }
 }
