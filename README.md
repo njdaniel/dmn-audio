@@ -11,7 +11,7 @@ This crate was written inside [`njdaniel/daemon`](https://github.com/njdaniel/da
 Two things follow from that, until they are tidied up:
 
 - Issue and pull-request numbers in comments (`#108`, `PR #25`) and references to `docs/SPEC.md` point at `daemon`, not at this repository.
-- The API still speaks `daemon`'s language in places: sources are labelled `You` and `Interviewer`, `PipeWireSource` delivers 16 kHz mono in 20 ms frames (`MicCapture` delivers a microphone at a rate you choose, as plain samples in a ring), and the only output is the virtual microphone.
+- The API still speaks `daemon`'s language in places: sources are labelled `You` and `Interviewer`, `PipeWireSource` delivers 16 kHz mono in 20 ms frames (`MicCapture` delivers a microphone at a rate you choose, as plain samples in a ring), and there are two outputs: the virtual microphone, and `Playback`, which plays mono samples at a rate you choose to the default sink or a named one.
 
 ## Requirements
 

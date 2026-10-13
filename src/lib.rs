@@ -1,16 +1,21 @@
-//! Audio capture, and the virtual microphone.
+//! Audio capture, playback to a sink, and the virtual microphone.
 //!
 //! Input: a PipeWire node (mic `Audio/Source` or an app's `Stream/Output/Audio`) or a WAV file,
 //! and for [`MicCapture`] a microphone and a sample rate the caller picks;
 //! for the virtual microphone (#108), mono f32 speech at any rate (the TTS server's 24 kHz),
-//! and (#114) the user's own microphone, captured again at the graph rate for pass-through.
+//! and (#114) the user's own microphone, captured again at the graph rate for pass-through;
+//! for [`Playback`], mono f32 at a rate the caller picks, written by the caller into a ring, and
+//! the sink to play it to (the default one, or one named by its `node.name`).
 //! Output: 16 kHz mono f32 samples, one labelled stream per source (You / Interviewer); or, from
 //! [`MicCapture`], unlabelled mono f32 at the requested rate in a lock-free ring; for the
 //! virtual microphone, a PipeWire `Audio/Source` node named `dmn-voice` that plays that speech,
 //! and the microphone while pass-through is on and nothing is being spoken, at the graph rate
-//! to whatever selects it as its microphone.
+//! to whatever selects it as its microphone; from [`Playback`], that audio played at the
+//! requested rate to the sink, silence when the ring runs dry, with the sinks listed in
+//! [`NodeTable`].
 //! Owns: the PipeWire main-loop thread, one lock-free `ringbuf` producer per capture stream
-//! (and one per [`MicCapture`], with its supervisor thread),
+//! (and one per [`MicCapture`], with its supervisor thread), the lock-free ring a [`Playback`]'s
+//! callback reads (with its supervisor thread),
 //! the lock-free ring the virtual microphone's callback reads, and the lock-free ring between
 //! the pass-through's capture callback and that same playback callback.
 //! The process callbacks allocate nothing, lock nothing, log nothing.
@@ -22,7 +27,7 @@
 //! keeps the live [`NodeTable`] of mics and app streams. [`PipeWireSource`] (issue #5) captures a
 //! mic, one app's output stream (by `target.object`) or the default sink monitor on that loop
 //! thread, and re-attaches when the app restarts; [`PwRecordSource`] is the `pw-record`
-//! emergency fallback behind the same trait. [`VirtualMic`] (#108) is the one output: samples
+//! emergency fallback behind the same trait. [`VirtualMic`] (#108) is the first output: samples
 //! written to it are resampled by [`LinearResampler`] on the writer's thread into a ring the
 //! playback callback drains; an underrun is silence, never a stall. With a [`Passthrough`]
 //! (#114) the playback callback's [`Mixer`] also pops the microphone's ring, filled by a second
@@ -33,6 +38,16 @@
 //! that rate, and a stream that settles elsewhere is a [`MicError::RateMismatch`], never samples
 //! at another rate. It follows hot-plug with the same [`Reattach`] as [`PipeWireSource`]; a full
 //! ring drops the new samples and counts them in [`MicStatus`].
+//!
+//! [`Playback`] (issue #2) is the other direction at a rate of the caller's choosing: samples
+//! written to a [`PlaybackWriter`] are played by an ordinary playback stream that PipeWire
+//! links to the default sink, or to a sink named by [`SinkTarget::Named`]. The format pod asks
+//! for the rate and the callback plays nothing until the negotiated format is that rate, mono
+//! f32; a stream that settles elsewhere is a [`PlaybackError::RateMismatch`]. An underrun is
+//! silence and a count in [`PlaybackStatus`]. [`SinkFollow`] reconnects a named sink that
+//! returns (it never falls back to the default); the default sink is followed by the session
+//! manager. [`NodeTable::sinks`] and [`NodeTable::default_playback`] list outputs and mark the
+//! default.
 
 // CLAUDE.md: no unwrap/expect outside tests and main.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
@@ -41,8 +56,11 @@ mod capture;
 mod frames;
 mod mic;
 mod pipewire;
+mod playback;
 mod pwrecord;
 mod source;
+#[cfg(test)]
+mod testutil;
 mod vmic;
 mod wav;
 
@@ -56,7 +74,11 @@ pub use mic::{
 };
 pub use pipewire::{
     AppStream, CaptureNode, DEFAULT_GRAPH_RATE, NodeTable, PipeWireContext, PipeWireError,
-    RegistryEvent, parse_default_name, parse_rate,
+    RegistryEvent, SinkNode, parse_default_name, parse_rate,
+};
+pub use playback::{
+    DEFAULT_PLAYBACK_RING_MS, PLAYBACK_MAX_RATE, PLAYBACK_MIN_RATE, PLAYBACK_NODE_NAME, Playback,
+    PlaybackError, PlaybackStatus, PlaybackWriter, SinkAction, SinkFollow, SinkTarget,
 };
 pub use pwrecord::PwRecordSource;
 pub use source::{AudioError, AudioSource, Source};

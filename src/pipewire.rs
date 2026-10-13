@@ -1,8 +1,9 @@
 //! PipeWire discovery: one OS thread runs the PipeWire main loop; a registry listener keeps a
-//! live [`NodeTable`] of capture sources and app output streams (docs/SPEC.md § Audio capture on
+//! live [`NodeTable`] of capture sources, playback sinks and app output streams (docs/SPEC.md § Audio capture on
 //! PipeWire, Discovery). The same loop thread owns the capture streams of
 //! [`crate::PipeWireSource`] (issue #5), which it creates, retargets and closes on
-//! [`Command`]s, and the playback stream behind [`crate::VirtualMic`] (#108).
+//! [`Command`]s, the playback stream behind [`crate::VirtualMic`] (#108) and the one behind
+//! [`crate::Playback`].
 //!
 //! Threading: everything PipeWire-owned (`MainLoopRc`, `CoreRc`, `RegistryRc`, proxies,
 //! listeners) lives on the loop thread and is `!Send`; the table is shared through an
@@ -32,6 +33,7 @@ use pw::types::ObjectType;
 use crate::capture::{LoopCapture, OpenSpec};
 use crate::frames::FrameSink;
 use crate::mic::{LoopMic, MicSpec, MicWriter};
+use crate::playback::{LoopPlayback, PlaybackReader, PlaybackSpec};
 use crate::vmic::{LoopVmic, Mixer, VmicSpec};
 
 #[derive(Debug, thiserror::Error)]
@@ -55,6 +57,17 @@ pub struct CaptureNode {
     /// Registry global id; valid until the node is removed.
     pub id: u32,
     /// `node.name`, the stable identifier config refers to.
+    pub name: String,
+    /// `node.description`, what the picker shows.
+    pub description: String,
+}
+
+/// An output device or other playback node (`media.class = Audio/Sink`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SinkNode {
+    /// Registry global id; valid until the node is removed.
+    pub id: u32,
+    /// `node.name`, the stable identifier config refers to and `target.object` takes.
     pub name: String,
     /// `node.description`, what the picker shows.
     pub description: String,
@@ -93,6 +106,8 @@ pub enum RegistryEvent {
     Removed(u32),
     /// The `default.audio.source` metadata changed; `None` clears it.
     DefaultSource(Option<String>),
+    /// The `default.audio.sink` metadata changed; `None` clears it.
+    DefaultSink(Option<String>),
     /// The `settings` metadata's `clock.rate` (the graph's sample rate) changed; `None` clears
     /// it. `forced` carries `clock.force-rate`, which wins while it is set.
     ClockRate { rate: Option<u32>, forced: bool },
@@ -108,8 +123,11 @@ pub enum RegistryEvent {
 pub struct NodeTable {
     sources: BTreeMap<u32, CaptureNode>,
     streams: BTreeMap<u32, AppStream>,
+    sinks: BTreeMap<u32, SinkNode>,
     /// `node.name` of PipeWire's default source, from the `default` metadata object.
     pub default_source: Option<String>,
+    /// `node.name` of PipeWire's default sink, from the same `default` metadata object.
+    pub default_sink: Option<String>,
     /// The graph's sample rate (`clock.rate` in the `settings` metadata), if seen.
     pub clock_rate: Option<u32>,
     /// `clock.force-rate`, if set and non-zero: the rate the graph is pinned to.
@@ -131,6 +149,17 @@ impl NodeTable {
     /// App output streams, ordered by id.
     pub fn streams(&self) -> impl Iterator<Item = &AppStream> {
         self.streams.values()
+    }
+
+    /// Playback sinks (`Audio/Sink`), ordered by id.
+    pub fn sinks(&self) -> impl Iterator<Item = &SinkNode> {
+        self.sinks.values()
+    }
+
+    /// The default sink, if its metadata was seen and it is in the table.
+    pub fn default_playback(&self) -> Option<&SinkNode> {
+        let name = self.default_sink.as_deref()?;
+        self.sinks.values().find(|n| n.name == name)
     }
 
     /// The default capture source, if its metadata was seen and it is in the table.
@@ -170,6 +199,22 @@ impl NodeTable {
                         self.sources.insert(
                             id,
                             CaptureNode {
+                                id,
+                                name,
+                                description,
+                            },
+                        );
+                        true
+                    }
+                    Some("Audio/Sink") => {
+                        let name = get("node.name").unwrap_or_default().to_owned();
+                        let description = get("node.description")
+                            .or_else(|| get("node.nick"))
+                            .unwrap_or(&name)
+                            .to_owned();
+                        self.sinks.insert(
+                            id,
+                            SinkNode {
                                 id,
                                 name,
                                 description,
@@ -227,15 +272,28 @@ impl NodeTable {
                 {
                     n.description = d.to_owned();
                     changed = true;
+                } else if let Some(n) = self.sinks.get_mut(&id)
+                    && let Some(d) = get("node.description")
+                    && n.description != d
+                {
+                    n.description = d.to_owned();
+                    changed = true;
                 }
                 changed
             }
             RegistryEvent::Removed(id) => {
-                self.sources.remove(&id).is_some() | self.streams.remove(&id).is_some()
+                self.sources.remove(&id).is_some()
+                    | self.streams.remove(&id).is_some()
+                    | self.sinks.remove(&id).is_some()
             }
             RegistryEvent::DefaultSource(name) => {
                 let changed = self.default_source != name;
                 self.default_source = name;
+                changed
+            }
+            RegistryEvent::DefaultSink(name) => {
+                let changed = self.default_sink != name;
+                self.default_sink = name;
                 changed
             }
             RegistryEvent::ClockRate { rate, forced } => {
@@ -347,6 +405,25 @@ pub(crate) enum Command {
     },
     /// Disconnect and destroy the virtual microphone under `key`; its node leaves the graph.
     CloseVmic {
+        key: u64,
+    },
+    /// Create a playback stream (not connected yet) under `key`.
+    OpenPlayback {
+        key: u64,
+        spec: PlaybackSpec,
+        reader: PlaybackReader,
+    },
+    /// Retarget and (re)connect the playback stream under `key`; `None` is the default sink.
+    ConnectPlayback {
+        key: u64,
+        target_object: Option<String>,
+    },
+    /// Disconnect the playback stream under `key`; it can be connected again.
+    DisconnectPlayback {
+        key: u64,
+    },
+    /// Disconnect and destroy the playback stream under `key`; its node leaves the graph.
+    ClosePlayback {
         key: u64,
     },
 }
@@ -494,6 +571,8 @@ fn loop_thread(
     let captures: Rc<RefCell<HashMap<u64, LoopCapture>>> = Rc::new(RefCell::new(HashMap::new()));
     let vmics: Rc<RefCell<HashMap<u64, LoopVmic>>> = Rc::new(RefCell::new(HashMap::new()));
     let mics: Rc<RefCell<HashMap<u64, LoopMic>>> = Rc::new(RefCell::new(HashMap::new()));
+    let playbacks: Rc<RefCell<HashMap<u64, LoopPlayback>>> = Rc::new(RefCell::new(HashMap::new()));
+    let cmd_playbacks = Rc::clone(&playbacks);
     let cmd_captures = Rc::clone(&captures);
     let cmd_mics = Rc::clone(&mics);
     let cmd_vmics = Rc::clone(&vmics);
@@ -563,6 +642,29 @@ fn loop_thread(
         }
         Command::CloseVmic { key } => {
             let closed = cmd_vmics.borrow_mut().remove(&key);
+            drop(closed);
+        }
+        Command::OpenPlayback { key, spec, reader } => {
+            let status = Arc::clone(&spec.status);
+            match LoopPlayback::open(&cmd_core, spec, reader) {
+                Ok(p) => {
+                    cmd_playbacks.borrow_mut().insert(key, p);
+                }
+                Err(e) => status.set_error(e),
+            }
+        }
+        Command::ConnectPlayback { key, target_object } => {
+            if let Some(p) = cmd_playbacks.borrow_mut().get_mut(&key) {
+                p.connect(target_object.as_deref());
+            }
+        }
+        Command::DisconnectPlayback { key } => {
+            if let Some(p) = cmd_playbacks.borrow_mut().get_mut(&key) {
+                p.disconnect();
+            }
+        }
+        Command::ClosePlayback { key } => {
+            let closed = cmd_playbacks.borrow_mut().remove(&key);
             drop(closed);
         }
     });
@@ -644,7 +746,7 @@ fn loop_thread(
                         }
                     }
                 }
-                // `default` carries the default source; `settings` the graph's clock rate
+                // `default` carries the default source and sink; `settings` the graph's clock rate
                 // (#108: the virtual microphone plays at that rate).
                 ObjectType::Metadata
                     if matches!(props.get("metadata.name"), Some("default" | "settings")) =>
@@ -662,6 +764,11 @@ fn loop_thread(
                             match key {
                                 Some("default.audio.source") => {
                                     meta_shared.apply(RegistryEvent::DefaultSource(
+                                        value.and_then(parse_default_name),
+                                    ));
+                                }
+                                Some("default.audio.sink") => {
+                                    meta_shared.apply(RegistryEvent::DefaultSink(
                                         value.and_then(parse_default_name),
                                     ));
                                 }
@@ -714,6 +821,7 @@ fn loop_thread(
     captures.borrow_mut().clear();
     mics.borrow_mut().clear();
     vmics.borrow_mut().clear();
+    playbacks.borrow_mut().clear();
     drop(_commands);
     drop(_registry_listener);
     drop(nodes);
@@ -755,10 +863,11 @@ mod tests {
                 ("node.name", "firefox.out"),
             ],
         )));
-        // Sinks, ports, links and other classes are ignored and do not bump the generation.
+        // Ports, links and other classes are ignored and do not bump the generation. (Sinks
+        // were ignored here until `NodeTable` learned to list them; see the sink tests.)
         assert!(!t.apply(added(
             42,
-            &[("media.class", "Audio/Sink"), ("node.name", "speakers")]
+            &[("media.class", "Audio/Duplex"), ("node.name", "speakers")]
         )));
         assert!(!t.apply(added(43, &[("object.serial", "7")])));
 
@@ -868,6 +977,88 @@ mod tests {
         assert!(!t.apply(RegistryEvent::DefaultSource(Some("alsa_input.pci".into()))));
         assert!(t.apply(RegistryEvent::DefaultSource(None)));
         assert!(t.default_capture().is_none());
+    }
+
+    #[test]
+    fn sinks_are_listed_with_their_names_and_descriptions_and_apart_from_sources() {
+        let mut t = NodeTable::default();
+        assert!(t.apply(added(
+            50,
+            &[
+                ("media.class", "Audio/Sink"),
+                ("node.name", "alsa_output.pci.analog-stereo"),
+                ("node.description", "Built-in Audio"),
+            ],
+        )));
+        assert!(t.apply(added(
+            51,
+            &[("media.class", "Audio/Sink"), ("node.name", "bt-headset")],
+        )));
+        assert!(t.apply(added(
+            52,
+            &[("media.class", "Audio/Source"), ("node.name", "usb-mic")],
+        )));
+        let sinks: Vec<_> = t.sinks().map(|s| (s.id, s.name.as_str())).collect();
+        assert_eq!(
+            sinks,
+            [(50, "alsa_output.pci.analog-stereo"), (51, "bt-headset")]
+        );
+        assert_eq!(
+            t.sinks().next().map(|s| s.description.as_str()),
+            Some("Built-in Audio")
+        );
+        assert_eq!(
+            t.sinks().nth(1).map(|s| s.description.as_str()),
+            Some("bt-headset"),
+            "no description: the name"
+        );
+        assert_eq!(t.sources().count(), 1, "a sink is not a source");
+
+        // The description arrives later with the bound node's info, as it can for a source.
+        let g = t.generation;
+        let upd = |d: &str| RegistryEvent::Updated {
+            id: 51,
+            props: vec![("node.description".into(), d.into())],
+        };
+        assert!(t.apply(upd("Headset")));
+        assert!(!t.apply(upd("Headset")));
+        assert_eq!(t.generation, g + 1);
+
+        assert!(t.apply(RegistryEvent::Removed(51)));
+        assert_eq!(t.sinks().count(), 1);
+        assert!(!t.apply(RegistryEvent::Removed(51)));
+    }
+
+    #[test]
+    fn default_sink_resolves_to_a_tracked_sink_and_is_independent_of_the_default_source() {
+        let mut t = NodeTable::default();
+        t.apply(added(
+            60,
+            &[("media.class", "Audio/Sink"), ("node.name", "speakers")],
+        ));
+        t.apply(added(
+            61,
+            &[("media.class", "Audio/Sink"), ("node.name", "headset")],
+        ));
+        assert!(t.default_playback().is_none());
+        assert!(t.apply(RegistryEvent::DefaultSink(Some("speakers".into()))));
+        assert_eq!(t.default_playback().map(|n| n.id), Some(60));
+        assert!(!t.apply(RegistryEvent::DefaultSink(Some("speakers".into()))));
+        // The default moves.
+        assert!(t.apply(RegistryEvent::DefaultSink(Some("headset".into()))));
+        assert_eq!(t.default_playback().map(|n| n.id), Some(61));
+        assert!(
+            t.default_capture().is_none(),
+            "the source default is untouched"
+        );
+        // A default the table does not hold resolves to nothing; the name is still reported.
+        assert!(t.apply(RegistryEvent::Removed(61)));
+        assert!(t.default_playback().is_none());
+        assert_eq!(t.default_sink.as_deref(), Some("headset"));
+        assert!(t.apply(RegistryEvent::DefaultSink(None)));
+        // The source default does not set the sink default.
+        assert!(t.apply(RegistryEvent::DefaultSource(Some("speakers".into()))));
+        assert!(t.default_sink.is_none());
     }
 
     #[test]
