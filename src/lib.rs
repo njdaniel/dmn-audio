@@ -1,13 +1,16 @@
 //! Audio capture, and the virtual microphone.
 //!
-//! Input: a PipeWire node (mic `Audio/Source` or an app's `Stream/Output/Audio`) or a WAV file;
+//! Input: a PipeWire node (mic `Audio/Source` or an app's `Stream/Output/Audio`) or a WAV file,
+//! and for [`MicCapture`] a microphone and a sample rate the caller picks;
 //! for the virtual microphone (#108), mono f32 speech at any rate (the TTS server's 24 kHz),
 //! and (#114) the user's own microphone, captured again at the graph rate for pass-through.
-//! Output: 16 kHz mono f32 samples, one labelled stream per source (You / Interviewer); for the
+//! Output: 16 kHz mono f32 samples, one labelled stream per source (You / Interviewer); or, from
+//! [`MicCapture`], unlabelled mono f32 at the requested rate in a lock-free ring; for the
 //! virtual microphone, a PipeWire `Audio/Source` node named `dmn-voice` that plays that speech,
 //! and the microphone while pass-through is on and nothing is being spoken, at the graph rate
 //! to whatever selects it as its microphone.
-//! Owns: the PipeWire main-loop thread, one lock-free `ringbuf` producer per capture stream,
+//! Owns: the PipeWire main-loop thread, one lock-free `ringbuf` producer per capture stream
+//! (and one per [`MicCapture`], with its supervisor thread),
 //! the lock-free ring the virtual microphone's callback reads, and the lock-free ring between
 //! the pass-through's capture callback and that same playback callback.
 //! The process callbacks allocate nothing, lock nothing, log nothing.
@@ -24,13 +27,19 @@
 //! playback callback drains; an underrun is silence, never a stall. With a [`Passthrough`]
 //! (#114) the playback callback's [`Mixer`] also pops the microphone's ring, filled by a second
 //! capture stream's callback, under a gain that fades at every switch and is shut while speech
-//! plays.
+//! plays. [`MicCapture`] is the microphone at a rate of the caller's choosing: no 20 ms framing
+//! and no [`Source`] label, samples popped from a [`MicReader`]. PipeWire converts to the rate
+//! (the format pod asks for it), the callback copies nothing until the negotiated format is
+//! that rate, and a stream that settles elsewhere is a [`MicError::RateMismatch`], never samples
+//! at another rate. It follows hot-plug with the same [`Reattach`] as [`PipeWireSource`]; a full
+//! ring drops the new samples and counts them in [`MicStatus`].
 
 // CLAUDE.md: no unwrap/expect outside tests and main.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 mod capture;
 mod frames;
+mod mic;
 mod pipewire;
 mod pwrecord;
 mod source;
@@ -41,6 +50,10 @@ pub use capture::{
     Action, CaptureMode, CaptureState, CaptureStatus, CaptureTarget, PipeWireSource, Reattach,
 };
 pub use frames::{FrameSink, Frames, frame_channel};
+pub use mic::{
+    DEFAULT_MIC_RING_MS, MIC_MAX_RATE, MIC_MIN_RATE, MIC_NODE_NAME, MicCapture, MicError,
+    MicReader, MicStatus, RatePlan, plan_rate,
+};
 pub use pipewire::{
     AppStream, CaptureNode, DEFAULT_GRAPH_RATE, NodeTable, PipeWireContext, PipeWireError,
     RegistryEvent, parse_default_name, parse_rate,
