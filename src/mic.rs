@@ -8,7 +8,12 @@
 //! - [`Reattach`], the same state machine [`crate::PipeWireSource`] uses, driven by this
 //!   source's supervisor thread with a [`CaptureTarget::Mic`]. A named microphone that goes away
 //!   is disconnected and reconnected when it returns; the default microphone has no
-//!   `target.object`, so the session manager itself moves the stream to a new default.
+//!   `target.object`, so the session manager itself moves the stream to a new default. Two
+//!   things `Reattach` does are worth knowing here. A named microphone that is absent when
+//!   capture starts is stood in for by the default one until it appears
+//!   ([`MicStatus::fallback`] says so). And the default microphone going away is not a
+//!   `Disconnected`: the stream is left for the session manager to move, and the status shows
+//!   `Connecting` until it has.
 //! - `LoopMic`, the `pw_stream` and its listeners, on the PipeWire loop thread. The supervisor
 //!   reaches it through [`crate::pipewire::Command`]s, and its stream lives from `start` to
 //!   `stop`: a reconnect keeps the stream and with it the ring's writer.
@@ -45,7 +50,8 @@ use crate::source::AudioError;
 pub const MIC_MIN_RATE: u32 = 8_000;
 /// Highest rate [`MicCapture`] accepts, in Hz.
 pub const MIC_MAX_RATE: u32 = 192_000;
-/// How much audio the ring holds when the caller does not say, in milliseconds.
+/// A ring length that suits a caller with no reason to pick another, in milliseconds: long
+/// enough that an overrun means the reader stalled, not that it was briefly late.
 pub const DEFAULT_MIC_RING_MS: u32 = 2_000;
 /// `node.name` of the capture stream, as `pw-cli` and patchbays show it.
 pub const MIC_NODE_NAME: &str = "dmn.capture";
@@ -157,6 +163,12 @@ pub struct MicStatus {
     /// `FORMAT_OK` once `param_changed` has seen the format asked for; the callback copies
     /// nothing while it is anything else.
     format: AtomicU8,
+    /// Whether PipeWire last reported the stream as `Streaming`. Kept apart from `state`, which
+    /// a rejected format holds at `Error`: when a good format then arrives on the same stream,
+    /// this says where `state` goes back to.
+    running: AtomicBool,
+    /// True while a named microphone that is not there is being stood in for by the default one.
+    fallback: AtomicBool,
     pushed: AtomicU64,
     dropped: AtomicU64,
     last_error: Mutex<Option<String>>,
@@ -196,17 +208,27 @@ impl MicStatus {
         self.converted.load(Ordering::Relaxed) != 0
     }
 
-    /// Samples pushed into the ring since start.
+    /// True while the capture was asked for a microphone by name, that microphone is not
+    /// there, and the default one is being captured in its place. [`Reattach`] does this for a
+    /// named microphone that is absent when capture starts, and moves to the named one when it
+    /// appears; a caller for whom another microphone is worse than none checks here.
+    pub fn fallback(&self) -> bool {
+        self.fallback.load(Ordering::Acquire)
+    }
+
+    /// Samples pushed into the ring since the last [`MicCapture::start`].
     pub fn pushed(&self) -> u64 {
         self.pushed.load(Ordering::Relaxed)
     }
 
-    /// Samples the ring had no room for and dropped (the newest ones), since start.
+    /// Samples the ring had no room for and dropped (the newest ones), since the last
+    /// [`MicCapture::start`].
     pub fn dropped(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
     }
 
-    /// The last error PipeWire or the format check reported.
+    /// The error PipeWire or the format check reported on the current connection; `None` once
+    /// the stream is connected again.
     pub fn last_error(&self) -> Option<String> {
         self.last_error
             .lock()
@@ -223,11 +245,35 @@ impl MicStatus {
         self.set_state(CaptureState::Error);
     }
 
-    /// The format was cleared, or the stream is being reconnected: nothing is delivered and no
-    /// rate is known until a new format settles. Shuts the gate the real-time callback checks.
-    fn format_unsettled(&self) {
+    fn clear_error(&self) {
+        *self.last_error.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// A new capture begins: counters and the last error start over.
+    fn restart(&self) {
+        self.pushed.store(0, Ordering::Relaxed);
+        self.dropped.store(0, Ordering::Relaxed);
+        self.fallback.store(false, Ordering::Release);
+        self.clear_error();
+    }
+
+    /// The stream is being connected, or connected again: nothing is delivered and no rate is
+    /// known until a format settles, and what the last connection reported is over. Shuts the
+    /// gate the real-time callback checks.
+    fn connection_reset(&self) {
         self.format.store(FORMAT_UNSETTLED, Ordering::Release);
         self.negotiated_rate.store(0, Ordering::Release);
+        self.running.store(false, Ordering::Release);
+    }
+
+    /// PipeWire withdrew the stream's format. The gate shuts. A rejection stands, with the rate
+    /// that caused it, until a new format settles or the stream is connected again: the reason
+    /// nothing is delivered must not turn into "unknown" on the way down.
+    fn format_cleared(&self) {
+        if self.format.load(Ordering::Acquire) != FORMAT_REJECTED {
+            self.format.store(FORMAT_UNSETTLED, Ordering::Release);
+            self.negotiated_rate.store(0, Ordering::Release);
+        }
     }
 
     /// PipeWire settled on a format. The gate is set before anything is reported, so no buffer
@@ -235,7 +281,20 @@ impl MicStatus {
     fn format_settled(&self, rate: u32, channels: u32, format: spa::param::audio::AudioFormat) {
         self.negotiated_rate.store(rate, Ordering::Release);
         match check_format(self.requested_rate(), rate, channels, format) {
-            Ok(()) => self.format.store(FORMAT_OK, Ordering::Release),
+            Ok(()) => {
+                let was = self.format.swap(FORMAT_OK, Ordering::AcqRel);
+                if was == FORMAT_REJECTED {
+                    // The same stream, renegotiated to what was asked for. PipeWire sends no
+                    // new state for that, so the state the rejection held at `Error` is put
+                    // back to where the stream is.
+                    self.clear_error();
+                    self.set_state(if self.running.load(Ordering::Acquire) {
+                        CaptureState::Streaming
+                    } else {
+                        CaptureState::Connecting
+                    });
+                }
+            }
             Err(e) => {
                 self.format.store(FORMAT_REJECTED, Ordering::Release);
                 self.set_error(e.to_string());
@@ -244,9 +303,13 @@ impl MicStatus {
     }
 
     /// The stream reached `Streaming`. One whose format was rejected is running too, but
-    /// nothing it carries is delivered: it stays in `Error`.
+    /// nothing it carries is delivered: it stays in `Error`. One the supervisor has already
+    /// called unplugged stays `Disconnected`: this event was on its way when the device went.
     fn stream_streaming(&self) {
-        if self.format.load(Ordering::Acquire) != FORMAT_REJECTED {
+        self.running.store(true, Ordering::Release);
+        if self.state() != CaptureState::Disconnected
+            && self.format.load(Ordering::Acquire) != FORMAT_REJECTED
+        {
             self.set_state(CaptureState::Streaming);
         }
     }
@@ -254,6 +317,7 @@ impl MicStatus {
     /// The stream is connecting or paused. Neither hides an unplugged device nor a rejected
     /// format, which only the next connection clears.
     fn stream_waiting(&self) {
+        self.running.store(false, Ordering::Release);
         if self.state() != CaptureState::Disconnected
             && self.format.load(Ordering::Acquire) != FORMAT_REJECTED
         {
@@ -457,12 +521,12 @@ impl LoopMic {
                 }
                 let Some(param) = param else {
                     // The format was cleared: stop the callback until a new one is negotiated.
-                    format_status.format_unsettled();
+                    format_status.format_cleared();
                     return;
                 };
                 let mut info = spa::param::audio::AudioInfoRaw::new();
                 if info.parse(param).is_err() {
-                    format_status.format_unsettled();
+                    format_status.format_cleared();
                     return;
                 }
                 format_status.format_settled(info.rate(), info.channels(), info.format());
@@ -487,7 +551,8 @@ impl LoopMic {
     }
 
     fn try_connect(&mut self, target_object: Option<&str>) -> Result<(), String> {
-        self.disconnect();
+        self.unlink();
+        self.status.clear_error();
         let target = target_object
             .map(|t| CString::new(t).map_err(|_| format!("target {t:?} contains a NUL byte")))
             .transpose()?;
@@ -515,9 +580,17 @@ impl LoopMic {
         Ok(())
     }
 
+    /// The device is gone (the supervisor's `Disconnect`): unlink, and say so. The supervisor
+    /// set `Disconnected` when it sent the command, but a `Streaming` event already on its way
+    /// could have landed since; on this thread, after the unlink, none can.
     pub(crate) fn disconnect(&mut self) {
+        self.unlink();
+        self.status.set_state(CaptureState::Disconnected);
+    }
+
+    fn unlink(&mut self) {
         // A reconnect renegotiates the format, so the old verdict must not carry over.
-        self.status.format_unsettled();
+        self.status.connection_reset();
         if self.connected {
             // After this returns the data thread no longer calls `mic_process`.
             let _ = self.stream.disconnect();
@@ -528,7 +601,7 @@ impl LoopMic {
 
 impl Drop for LoopMic {
     fn drop(&mut self) {
-        self.disconnect();
+        self.unlink();
         self.status.set_state(CaptureState::Idle);
     }
 }
@@ -601,12 +674,15 @@ impl MicCapture {
     }
 
     /// Create the stream and start following the microphone. Returns the ring's reader at once;
-    /// the stream connects in the background, see [`Self::wait_streaming`]. Calling it twice is
-    /// an error.
+    /// the stream connects in the background, see [`Self::wait_streaming`]. Calling it while
+    /// started is an error. After [`Self::stop`] it may be called again: that is a new capture
+    /// with a new ring, the status counters and last error start over, and the reader of the
+    /// capture before it gets nothing more.
     pub fn start(&mut self) -> Result<MicReader, MicError> {
         if self.key.is_some() {
             return Err(AudioError::AlreadyStarted.into());
         }
+        self.status.restart();
         let plan = plan_rate(self.rate, self.ctx.nodes().graph_rate())?;
         self.status
             .converted
@@ -629,6 +705,7 @@ impl MicCapture {
         let stop = Arc::clone(&self.stop);
         let status = Arc::clone(&self.status);
         let mut reattach = Reattach::new(self.target.clone());
+        let named = matches!(self.target, CaptureTarget::Mic(Some(_)));
         let handle = std::thread::Builder::new()
             .name("dmn-capture-mic".into())
             .spawn(move || {
@@ -637,6 +714,11 @@ impl MicCapture {
                     if let Some(action) = reattach.step(&table) {
                         let cmd = match action {
                             Action::Connect { target_object, .. } => {
+                                // A named microphone connected with no target is `Reattach`
+                                // standing the default one in for it.
+                                status
+                                    .fallback
+                                    .store(named && target_object.is_none(), Ordering::Release);
                                 status.set_state(CaptureState::Connecting);
                                 Command::Connect {
                                     key,
@@ -645,6 +727,7 @@ impl MicCapture {
                                 }
                             }
                             Action::Disconnect => {
+                                status.fallback.store(false, Ordering::Release);
                                 status.set_state(CaptureState::Disconnected);
                                 Command::Disconnect { key }
                             }
@@ -900,11 +983,11 @@ mod tests {
         st.format_settled(44_100, 1, AudioFormat::F32LE);
         assert_eq!(st.delivered_rate(), None, "settled on the wrong rate");
         assert_eq!(st.negotiated_rate(), Some(44_100));
-        st.format_unsettled();
+        st.connection_reset();
         assert_eq!((st.delivered_rate(), st.negotiated_rate()), (None, None));
         st.format_settled(48_000, 1, AudioFormat::F32LE);
         assert_eq!(st.delivered_rate(), Some(48_000));
-        st.format_unsettled();
+        st.connection_reset();
         assert_eq!(st.delivered_rate(), None, "a reconnect shuts the gate");
     }
 
@@ -941,7 +1024,7 @@ mod tests {
                 other => panic!("{rate} Hz × {channels} {format:?}: {other:?}"),
             }
             // The next connection starts clean.
-            st.format_unsettled();
+            st.connection_reset();
             st.set_state(CaptureState::Connecting);
             st.format_settled(48_000, 1, AudioFormat::F32LE);
             st.stream_waiting();
@@ -950,6 +1033,85 @@ mod tests {
             assert_eq!(st.delivered_rate(), Some(48_000));
             assert!(st.failure().is_none());
         }
+    }
+
+    /// PipeWire can settle a second time on the same stream. No state event comes with that, so
+    /// the status has to recover by itself, to where the stream is.
+    #[test]
+    fn a_good_format_after_a_rejected_one_on_the_same_stream_recovers_without_a_state_event() {
+        for running in [true, false] {
+            let st = status();
+            st.requested_rate.store(48_000, Ordering::Relaxed);
+            st.set_state(CaptureState::Connecting);
+            st.format_settled(48_000, 2, AudioFormat::F32LE);
+            st.stream_waiting();
+            if running {
+                st.stream_streaming();
+            }
+            assert_eq!(st.state(), CaptureState::Error);
+            st.format_settled(48_000, 1, AudioFormat::F32LE);
+            let want = if running {
+                CaptureState::Streaming
+            } else {
+                CaptureState::Connecting
+            };
+            assert_eq!(st.state(), want, "running: {running}");
+            assert_eq!(st.delivered_rate(), Some(48_000));
+            assert!(st.failure().is_none());
+            assert_eq!(st.last_error(), None, "the rejection is over");
+        }
+    }
+
+    /// The reason survives PipeWire withdrawing the format on the way down, and ends with the
+    /// connection.
+    #[test]
+    fn a_rate_mismatch_is_still_one_after_the_format_is_cleared() {
+        let st = status();
+        st.requested_rate.store(48_000, Ordering::Relaxed);
+        st.format_settled(44_100, 1, AudioFormat::F32LE);
+        st.format_cleared();
+        assert!(matches!(
+            st.failure(),
+            Some(MicError::RateMismatch {
+                requested: 48_000,
+                negotiated: 44_100
+            })
+        ));
+        assert_eq!(st.delivered_rate(), None);
+        // A healthy stream whose format is cleared just stops delivering.
+        let st = status();
+        st.requested_rate.store(48_000, Ordering::Relaxed);
+        st.format_settled(48_000, 1, AudioFormat::F32LE);
+        st.stream_streaming();
+        st.format_cleared();
+        assert_eq!((st.delivered_rate(), st.negotiated_rate()), (None, None));
+        assert!(st.failure().is_none());
+    }
+
+    /// A `Streaming` event that was on its way when the device went must not undo
+    /// `Disconnected`.
+    #[test]
+    fn a_late_streaming_event_does_not_undo_disconnected() {
+        let st = status();
+        st.requested_rate.store(48_000, Ordering::Relaxed);
+        st.format_settled(48_000, 1, AudioFormat::F32LE);
+        st.set_state(CaptureState::Disconnected);
+        st.stream_streaming();
+        assert_eq!(st.state(), CaptureState::Disconnected);
+    }
+
+    #[test]
+    fn a_new_capture_starts_its_counters_and_its_error_over() {
+        let st = status();
+        let (mut w, _r) = mic_ring(4, Arc::clone(&st));
+        w.push(&[0.0; 6]);
+        st.set_error("boom".into());
+        st.fallback.store(true, Ordering::Release);
+        assert_eq!((st.pushed(), st.dropped()), (4, 2));
+        st.restart();
+        assert_eq!((st.pushed(), st.dropped()), (0, 0));
+        assert_eq!(st.last_error(), None);
+        assert!(!st.fallback());
     }
 
     #[test]
@@ -989,6 +1151,13 @@ mod tests {
         assert_eq!(r.step(&t), None, "nothing before the first enumeration");
         t.apply(RegistryEvent::Synced);
         assert_eq!(r.step(&t), connect(None));
+        assert_eq!(r.step(&t), None);
+        // The default microphone itself coming and going is the session manager's to follow:
+        // `Reattach` neither disconnects nor reconnects, so the status never says
+        // `Disconnected` for it (the stream's own state shows `Connecting` meanwhile).
+        mic(&mut t, 40, "built-in");
+        assert_eq!(r.step(&t), None);
+        t.apply(RegistryEvent::Removed(40));
         assert_eq!(r.step(&t), None);
         t.apply(RegistryEvent::Disconnected("gone".into()));
         assert_eq!(r.step(&t), Some(Action::Disconnect));
@@ -1169,6 +1338,14 @@ mod tests {
             let _ = tone.wait();
             assert_tone_at(&heard, 48_000, 1.0, "first run");
             assert_eq!(st.dropped(), 0, "the reader kept up");
+            assert!(!st.fallback(), "the named source itself, not the default");
+            // Counted: everything read was counted as pushed, and nothing else was.
+            let pushed = st.pushed() as usize;
+            assert!(
+                pushed >= heard.len() && pushed <= heard.len() + reader.queued() + 4_800,
+                "pushed {pushed}, read {}",
+                heard.len()
+            );
 
             // Unplug: the capture reports it and the ring stops filling.
             drop(first);
