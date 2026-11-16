@@ -5,17 +5,25 @@
 //! for the virtual microphone (#108), mono f32 speech at any rate (the TTS server's 24 kHz),
 //! and (#114) the user's own microphone, captured again at the graph rate for pass-through;
 //! for [`Playback`], mono f32 at a rate the caller picks, written by the caller into a ring, and
-//! the sink to play it to (the default one, or one named by its `node.name`).
+//! the sink to play it to (the default one, or one named by its `node.name`); for
+//! [`StreamCapture`] (#8), one application output stream named by its `object.serial`, and a
+//! rate and channel count (1 or 2) the caller picks.
 //! Output: 16 kHz mono f32 samples, one labelled stream per source (You / Interviewer); or, from
-//! [`MicCapture`], unlabelled mono f32 at the requested rate in a lock-free ring; for the
+//! [`MicCapture`], unlabelled mono f32 at the requested rate in a lock-free ring; from
+//! [`StreamCapture`], f32 at the requested rate and channel count (interleaved when stereo) in
+//! a lock-free ring, one per captured stream; in [`NodeTable`], per app stream, who it belongs
+//! to ([`NodeTable::stream_metadata`]: the claimed `application.process.id` and where it came
+//! from, the trusted `pipewire.sec.pid` of the owning client only, and whether
+//! `application.name` was really set); for the
 //! virtual microphone, a PipeWire `Audio/Source` node named `dmn-voice` that plays that speech,
 //! and the microphone while pass-through is on and nothing is being spoken, at the graph rate
 //! to whatever selects it as its microphone; from [`Playback`], that audio played at the
 //! requested rate to the sink, silence when the ring runs dry, with the sinks listed in
 //! [`NodeTable`].
 //! Owns: the PipeWire main-loop thread, one lock-free `ringbuf` producer per capture stream
-//! (and one per [`MicCapture`], with its supervisor thread), the lock-free ring a [`Playback`]'s
-//! callback reads (with its supervisor thread),
+//! (and one per [`MicCapture`] and per [`StreamCapture`], each with its supervisor thread), the
+//! lock-free ring a [`Playback`]'s callback reads (with its supervisor thread), the bound
+//! proxies of app stream nodes and of PipeWire clients (for their properties),
 //! the lock-free ring the virtual microphone's callback reads, and the lock-free ring between
 //! the pass-through's capture callback and that same playback callback.
 //! The process callbacks allocate nothing, lock nothing, log nothing.
@@ -59,6 +67,7 @@ mod pipewire;
 mod playback;
 mod pwrecord;
 mod source;
+mod stream;
 #[cfg(test)]
 mod testutil;
 mod vmic;
@@ -74,7 +83,8 @@ pub use mic::{
 };
 pub use pipewire::{
     AppStream, CaptureNode, DEFAULT_GRAPH_RATE, NodeTable, PipeWireContext, PipeWireError,
-    RegistryEvent, SinkNode, parse_default_name, parse_rate,
+    PropertyOrigin, REGISTRY_CLIENT_KEY, RegistryEvent, SinkNode, StreamMetadata,
+    parse_default_name, parse_rate,
 };
 pub use playback::{
     DEFAULT_PLAYBACK_RING_MS, PLAYBACK_MAX_RATE, PLAYBACK_MIN_RATE, PLAYBACK_NODE_NAME, Playback,
@@ -82,6 +92,10 @@ pub use playback::{
 };
 pub use pwrecord::PwRecordSource;
 pub use source::{AudioError, AudioSource, Source};
+pub use stream::{
+    DEFAULT_STREAM_RING_MS, STREAM_MAX_CHANNELS, STREAM_MAX_RATE, STREAM_MAX_RING_MS,
+    STREAM_MIN_RATE, STREAM_NODE_NAME, StreamCapture, StreamError, StreamReader, StreamStatus,
+};
 pub use vmic::{
     DEFAULT_RING_SECS, LinearResampler, Mixer, PASSTHROUGH_FADE_MS, Passthrough, PassthroughStats,
     RingStats, TAP_MAX_BACKLOG_MS, TAP_NODE_NAME, TAP_TARGET_BACKLOG_MS, TapReader, TapStats,

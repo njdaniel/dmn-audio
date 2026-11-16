@@ -2,8 +2,19 @@
 //! live [`NodeTable`] of capture sources, playback sinks and app output streams (docs/SPEC.md § Audio capture on
 //! PipeWire, Discovery). The same loop thread owns the capture streams of
 //! [`crate::PipeWireSource`] (issue #5), which it creates, retargets and closes on
-//! [`Command`]s, the playback stream behind [`crate::VirtualMic`] (#108) and the one behind
-//! [`crate::Playback`].
+//! [`Command`]s, the playback stream behind [`crate::VirtualMic`] (#108), the one behind
+//! [`crate::Playback`], and the per-application capture streams of [`crate::StreamCapture`].
+//!
+//! Who a stream belongs to (issue #8): app stream nodes are bound for their full info, and so
+//! are PipeWire *clients*, because `pipewire.sec.pid` is set by the protocol on the client
+//! object; a node reaches its client through its `client.id`. [`NodeTable::stream_metadata`]
+//! joins the two: the security pid comes from the client only (a node's own
+//! `pipewire.sec.pid` is application supplied and ignored), the claimed process id says where
+//! it came from ([`PropertyOrigin`]). For a
+//! PulseAudio-API application the owning client is the per-connection client `pipewire-pulse`
+//! makes, so its `pipewire.sec.pid` is the pid of `pipewire-pulse`, not of the application;
+//! the application's own pid is in `application.process.id`, which the application (or
+//! `pipewire-pulse` on its behalf) sets and which is therefore not authenticated.
 //!
 //! Threading: everything PipeWire-owned (`MainLoopRc`, `CoreRc`, `RegistryRc`, proxies,
 //! listeners) lives on the loop thread and is `!Send`; the table is shared through an
@@ -25,6 +36,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use pipewire as pw;
+use pw::client::Client;
 use pw::metadata::Metadata;
 use pw::node::Node;
 use pw::proxy::Listener;
@@ -34,6 +46,7 @@ use crate::capture::{LoopCapture, OpenSpec};
 use crate::frames::FrameSink;
 use crate::mic::{LoopMic, MicSpec, MicWriter};
 use crate::playback::{LoopPlayback, PlaybackReader, PlaybackSpec};
+use crate::stream::{LoopStream, StreamSpec, StreamWriter, resolve_serial};
 use crate::vmic::{LoopVmic, Mixer, VmicSpec};
 
 #[derive(Debug, thiserror::Error)]
@@ -87,11 +100,184 @@ pub struct AppStream {
     pub serial: Option<String>,
 }
 
+/// Where a value in [`StreamMetadata`] was read from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PropertyOrigin {
+    /// The `Stream/Output/Audio` node's own properties.
+    Node,
+    /// The properties of the PipeWire client that owns the node (the node's `client.id`).
+    Client,
+}
+
+/// Who an application stream belongs to, as [`NodeTable::stream_metadata`] reports it (#8).
+/// Kept apart from [`AppStream`] so that type's fields, and code that builds it, stay as they
+/// are. Every value is an `Option`: PipeWire sets none of them for certain.
+///
+/// Provenance, which matters for any rule built on these:
+///
+/// - `sec_pid` (`pipewire.sec.pid`) is **only ever read from the owning client** (the node's
+///   `client.id`). The protocol sets it on the client object from the peer credentials of its
+///   socket; it cannot be forged by the application. A node carrying a property of the same
+///   name is application supplied (a live probe showed a node with a forged
+///   `pipewire.sec.pid=42` while its client held the real pid), so that value is never read,
+///   never preferred and never used as a fallback: with no client known (absent, removed,
+///   or the node names none) `sec_pid` is `None`. It names the process holding the
+///   connection; for a PulseAudio-API application that is `pipewire-pulse`, not the
+///   application.
+/// - `application.process.id` is set by the application (or by `pipewire-pulse` from the
+///   PulseAudio client's own property list); it names the application for a PulseAudio-API
+///   stream too, but it is a claim, not a credential. Read from the node, else from the
+///   client. Never use it for a security decision.
+/// - `application_name` is the node's `application.name` exactly as set, and `None` when the
+///   node has none (or an empty one): [`AppStream::application`] then holds a fallback
+///   (`application.process.binary`, or `"unknown"`), which a caller matching on the name
+///   must not mistake for the name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct StreamMetadata {
+    /// Registry global id of the stream node, as [`AppStream::id`].
+    pub id: u32,
+    /// `object.serial` as a number, the only thing [`crate::StreamCapture`] targets.
+    pub serial: Option<u64>,
+    /// `client.id` of the node: the registry id of the client that owns it.
+    pub client_id: Option<u32>,
+    /// The node's `application.name`, `None` when it was not really set.
+    pub application_name: Option<String>,
+    /// `application.process.id`: the pid the application claims.
+    pub application_process_id: Option<u32>,
+    /// Where `application_process_id` came from.
+    pub application_process_id_origin: Option<PropertyOrigin>,
+    /// The owning client's `pipewire.sec.pid`, the trusted pid of the process holding the
+    /// PipeWire connection (for a PulseAudio-API application, `pipewire-pulse`). `None` when
+    /// the client is unknown or has none; a node's own property of that name is ignored.
+    pub sec_pid: Option<u32>,
+}
+
+/// Key the loop thread adds, with the value `"true"`, to the properties of a
+/// [`RegistryEvent::Added`] for a PipeWire *client* global, so [`NodeTable::apply`] can tell a
+/// client from a node without a new event variant. It is not a PipeWire property. A later
+/// [`RegistryEvent::Updated`] or [`RegistryEvent::Removed`] for that id reaches the client by
+/// its id (registry ids are unique among live globals).
+pub const REGISTRY_CLIENT_KEY: &str = "dmn.registry.client";
+
+/// What a stream node itself says about its owner. Values are merged as they arrive: the
+/// registry global carries a subset of the node's properties, its bound info the rest.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct NodeOwner {
+    client_id: Option<u32>,
+    application_name: Option<String>,
+    process_id: Option<u32>,
+}
+
+/// What a client says about itself.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ClientOwner {
+    process_id: Option<u32>,
+    sec_pid: Option<u32>,
+}
+
+fn prop<'a>(props: &'a [(String, String)], key: &str) -> Option<&'a str> {
+    props
+        .iter()
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v.as_str())
+}
+
+/// A registry id such as `client.id`.
+fn parse_id(v: &str) -> Option<u32> {
+    v.trim().parse().ok()
+}
+
+/// A process id; 0 is no process.
+fn parse_pid(v: &str) -> Option<u32> {
+    parse_id(v).filter(|&p| p != 0)
+}
+
+/// A name that is really there: absent, empty and blank are all "not set".
+fn parse_name(v: &str) -> Option<String> {
+    (!v.trim().is_empty()).then(|| v.to_owned())
+}
+
+/// Fold property `key` into `slot`. An absent key preserves the slot (a partial update); a
+/// key that is present replaces it, and one whose value does not parse (empty, malformed,
+/// zero pid) clears it. True when the slot changed.
+fn merge_key<T: PartialEq>(
+    slot: &mut Option<T>,
+    props: &[(String, String)],
+    key: &str,
+    parse: impl Fn(&str) -> Option<T>,
+) -> bool {
+    let Some(raw) = prop(props, key) else {
+        return false;
+    };
+    let v = parse(raw);
+    if *slot == v {
+        return false;
+    }
+    *slot = v;
+    true
+}
+
+/// `object.serial` as a number.
+fn parse_serial(v: Option<&str>) -> Option<u64> {
+    v?.trim().parse().ok()
+}
+
+impl NodeOwner {
+    fn merge(&mut self, props: &[(String, String)]) -> bool {
+        // `pipewire.sec.pid` on a node is application supplied: deliberately not read.
+        let mut changed = merge_key(&mut self.client_id, props, "client.id", parse_id);
+        changed |= merge_key(
+            &mut self.application_name,
+            props,
+            "application.name",
+            parse_name,
+        );
+        changed |= merge_key(
+            &mut self.process_id,
+            props,
+            "application.process.id",
+            parse_pid,
+        );
+        changed
+    }
+}
+
+impl ClientOwner {
+    fn merge(&mut self, props: &[(String, String)]) -> bool {
+        let mut changed = merge_key(
+            &mut self.process_id,
+            props,
+            "application.process.id",
+            parse_pid,
+        );
+        changed |= merge_key(&mut self.sec_pid, props, "pipewire.sec.pid", parse_pid);
+        changed
+    }
+}
+
+/// Whether any tracked stream node names `client` as its owner: only then does a change to the
+/// client change what [`NodeTable::stream_metadata`] reports.
+fn client_referenced(owners: &BTreeMap<u32, NodeOwner>, client: u32) -> bool {
+    owners.values().any(|o| o.client_id == Some(client))
+}
+
+/// The node's claim when it has one, else the client's, with where it came from. Only for
+/// untrusted claims such as `application.process.id`, never for `pipewire.sec.pid`.
+fn pick(node: Option<u32>, client: Option<u32>) -> (Option<u32>, Option<PropertyOrigin>) {
+    match (node, client) {
+        (Some(v), _) => (Some(v), Some(PropertyOrigin::Node)),
+        (None, Some(v)) => (Some(v), Some(PropertyOrigin::Client)),
+        (None, None) => (None, None),
+    }
+}
+
 /// One registry event, decoupled from libpipewire so the table logic is testable without a
 /// server. The loop thread produces these; [`NodeTable::apply`] consumes them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RegistryEvent {
-    /// A global appeared with these properties (only nodes matter; others are ignored).
+    /// A global appeared with these properties. Nodes are classified by `media.class`; a
+    /// client is recognised by [`REGISTRY_CLIENT_KEY`]; everything else is ignored.
     Added {
         id: u32,
         props: Vec<(String, String)>,
@@ -124,6 +310,10 @@ pub struct NodeTable {
     sources: BTreeMap<u32, CaptureNode>,
     streams: BTreeMap<u32, AppStream>,
     sinks: BTreeMap<u32, SinkNode>,
+    /// Owner properties of each app stream, by the stream's id (#8).
+    stream_owners: BTreeMap<u32, NodeOwner>,
+    /// PipeWire clients, by registry id: what a stream's `client.id` points at (#8).
+    clients: BTreeMap<u32, ClientOwner>,
     /// `node.name` of PipeWire's default source, from the `default` metadata object.
     pub default_source: Option<String>,
     /// `node.name` of PipeWire's default sink, from the same `default` metadata object.
@@ -154,6 +344,60 @@ impl NodeTable {
     /// Playback sinks (`Audio/Sink`), ordered by id.
     pub fn sinks(&self) -> impl Iterator<Item = &SinkNode> {
         self.sinks.values()
+    }
+
+    /// Who the app stream with registry id `id` belongs to; `None` when no such stream is in
+    /// the table. Joined from the node and its owning client each time it is asked, so it
+    /// follows both as their properties arrive, change and go; see [`StreamMetadata`] for
+    /// where each value comes from and what it can be trusted for.
+    pub fn stream_metadata(&self, id: u32) -> Option<StreamMetadata> {
+        let stream = self.streams.get(&id)?;
+        Some(self.metadata_of(stream))
+    }
+
+    /// App output streams with their [`StreamMetadata`], ordered by id.
+    pub fn streams_with_metadata(&self) -> impl Iterator<Item = (&AppStream, StreamMetadata)> {
+        let all = self.streams.values();
+        all.map(move |s| (s, self.metadata_of(s)))
+    }
+
+    /// The join behind [`Self::stream_metadata`]: the process id claim from the node, else
+    /// its client; the security pid from the owning client only.
+    fn metadata_of(&self, stream: &AppStream) -> StreamMetadata {
+        let id = stream.id;
+        let node = self.stream_owners.get(&id).cloned().unwrap_or_default();
+        let owner = node.client_id.and_then(|c| self.clients.get(&c));
+        let client = owner.cloned().unwrap_or_default();
+        let (application_process_id, application_process_id_origin) =
+            pick(node.process_id, client.process_id);
+        let sec_pid = client.sec_pid;
+        StreamMetadata {
+            id,
+            serial: parse_serial(stream.serial.as_deref()),
+            client_id: node.client_id,
+            application_name: node.application_name,
+            application_process_id,
+            application_process_id_origin,
+            sec_pid,
+        }
+    }
+
+    /// The app output stream (`Stream/Output/Audio`) whose `object.serial` is `serial`, if it
+    /// is in the table. Only app streams are searched: a sink or source with that serial is
+    /// never returned.
+    pub fn stream_by_serial(&self, serial: u64) -> Option<&AppStream> {
+        let has = |s: &&AppStream| parse_serial(s.serial.as_deref()) == Some(serial);
+        self.streams.values().find(has)
+    }
+
+    /// Whether a tracked source, sink or app stream other than `except_id` has the `node.name`
+    /// `name`. [`crate::StreamCapture`] refuses a serial that some node is also named, since
+    /// `target.object` matches names as well as serials.
+    pub(crate) fn node_named(&self, name: &str, except_id: u32) -> bool {
+        let source = self.sources.values().any(|n| n.name == name);
+        let sink = self.sinks.values().any(|n| n.name == name);
+        let named = |s: &AppStream| s.id != except_id && s.node_name == name;
+        source || sink || self.streams.values().any(named)
     }
 
     /// The default sink, if its metadata was seen and it is in the table.
@@ -240,7 +484,17 @@ impl NodeTable {
                                 serial,
                             },
                         );
+                        let mut owner = NodeOwner::default();
+                        owner.merge(&props);
+                        self.stream_owners.insert(id, owner);
                         true
+                    }
+                    _ if get(REGISTRY_CLIENT_KEY) == Some("true") => {
+                        let mut client = ClientOwner::default();
+                        client.merge(&props);
+                        let before = self.clients.insert(id, client.clone());
+                        before.unwrap_or_default() != client
+                            && client_referenced(&self.stream_owners, id)
                     }
                     _ => false,
                 }
@@ -266,6 +520,15 @@ impl NodeTable {
                             changed = true;
                         }
                     }
+                    if let Some(owner) = self.stream_owners.get_mut(&id)
+                        && owner.merge(&props)
+                    {
+                        changed = true;
+                    }
+                } else if self.clients.contains_key(&id) {
+                    let referenced = client_referenced(&self.stream_owners, id);
+                    let merged = self.clients.get_mut(&id).is_some_and(|c| c.merge(&props));
+                    changed = merged && referenced;
                 } else if let Some(n) = self.sources.get_mut(&id)
                     && let Some(d) = get("node.description")
                     && n.description != d
@@ -282,9 +545,15 @@ impl NodeTable {
                 changed
             }
             RegistryEvent::Removed(id) => {
+                self.stream_owners.remove(&id);
+                // A client that goes takes what it gave the streams it owned with it.
+                let removed = self.clients.remove(&id).unwrap_or_default();
+                let client_gone =
+                    removed != ClientOwner::default() && client_referenced(&self.stream_owners, id);
                 self.sources.remove(&id).is_some()
                     | self.streams.remove(&id).is_some()
                     | self.sinks.remove(&id).is_some()
+                    | client_gone
             }
             RegistryEvent::DefaultSource(name) => {
                 let changed = self.default_source != name;
@@ -426,12 +695,34 @@ pub(crate) enum Command {
     ClosePlayback {
         key: u64,
     },
+    /// Create a per-application stream capture (not connected yet) under `key` (#8).
+    OpenStream {
+        key: u64,
+        spec: StreamSpec,
+        writer: StreamWriter,
+    },
+    /// Connect the stream capture under `key` to the app stream with this `object.serial`.
+    /// There is no other kind of target: no name, no sink, no `stream.capture.sink`.
+    ConnectStream {
+        key: u64,
+        serial: u64,
+    },
+    /// Unlink the stream capture under `key`: its target is gone. It is never connected again.
+    DisconnectStream {
+        key: u64,
+    },
+    /// Disconnect and destroy the stream capture under `key`; its node leaves the graph.
+    CloseStream {
+        key: u64,
+    },
 }
 
 /// A bound `default` metadata proxy and its listener, kept alive for the loop's lifetime.
 type BoundMetadata = (Metadata, Box<dyn Listener>);
 /// A bound app-stream node and its info listener, kept until the global is removed.
 type BoundNode = (Node, Box<dyn Listener>);
+/// A bound client and its info listener, kept until the global is removed (#8).
+type BoundClient = (Client, Box<dyn Listener>);
 
 fn dict_to_vec(d: &pw::spa::utils::dict::DictRef) -> Vec<(String, String)> {
     d.iter()
@@ -572,6 +863,10 @@ fn loop_thread(
     let vmics: Rc<RefCell<HashMap<u64, LoopVmic>>> = Rc::new(RefCell::new(HashMap::new()));
     let mics: Rc<RefCell<HashMap<u64, LoopMic>>> = Rc::new(RefCell::new(HashMap::new()));
     let playbacks: Rc<RefCell<HashMap<u64, LoopPlayback>>> = Rc::new(RefCell::new(HashMap::new()));
+    let app_streams: Rc<RefCell<HashMap<u64, LoopStream>>> = Rc::new(RefCell::new(HashMap::new()));
+    let cmd_app_streams = Rc::clone(&app_streams);
+    let rm_app_streams = Rc::clone(&app_streams);
+    let cmd_shared = Arc::clone(&shared);
     let cmd_playbacks = Rc::clone(&playbacks);
     let cmd_captures = Rc::clone(&captures);
     let cmd_mics = Rc::clone(&mics);
@@ -667,6 +962,38 @@ fn loop_thread(
             let closed = cmd_playbacks.borrow_mut().remove(&key);
             drop(closed);
         }
+        Command::OpenStream { key, spec, writer } => {
+            let status = Arc::clone(&spec.status);
+            match LoopStream::open(&cmd_core, spec, writer) {
+                Ok(s) => {
+                    cmd_app_streams.borrow_mut().insert(key, s);
+                }
+                Err(e) => status.stream_error(e),
+            }
+        }
+        Command::ConnectStream { key, serial } => {
+            // Validated again, with the same rule as `StreamCapture::start`, on the thread that
+            // connects and right before it does: the serial must still name exactly one app
+            // stream and no node may be named like it. Anything else fails closed with its own
+            // error, and nothing is connected.
+            let checked = resolve_serial(&cmd_shared.lock(), serial).map(|_| ());
+            if let Some(s) = cmd_app_streams.borrow_mut().get_mut(&key) {
+                match checked {
+                    Ok(()) => s.connect(serial),
+                    Err(why) => s.refuse(why),
+                }
+            }
+        }
+        Command::DisconnectStream { key } => {
+            if let Some(s) = cmd_app_streams.borrow_mut().get_mut(&key) {
+                s.disconnect();
+            }
+        }
+        Command::CloseStream { key } => {
+            // The borrow ends before the stream is dropped.
+            let closed = cmd_app_streams.borrow_mut().remove(&key);
+            drop(closed);
+        }
     });
 
     // Core: `done` completes the initial sync; `error` on id 0 means we lost the server.
@@ -696,9 +1023,12 @@ fn loop_thread(
     // its property events tell us the default source.
     let holders: Rc<RefCell<Vec<BoundMetadata>>> = Rc::new(RefCell::new(Vec::new()));
     let nodes: Rc<RefCell<HashMap<u32, BoundNode>>> = Rc::new(RefCell::new(HashMap::new()));
+    let clients: Rc<RefCell<HashMap<u32, BoundClient>>> = Rc::new(RefCell::new(HashMap::new()));
     let add_holders = Rc::clone(&holders);
     let add_nodes = Rc::clone(&nodes);
     let rm_nodes = Rc::clone(&nodes);
+    let add_clients = Rc::clone(&clients);
+    let rm_clients = Rc::clone(&clients);
     let add_shared = Arc::clone(&shared);
     let rm_shared = Arc::clone(&shared);
     let registry_weak = registry.downgrade();
@@ -739,6 +1069,44 @@ fn loop_thread(
                         add_nodes
                             .borrow_mut()
                             .insert(id, (node, Box::new(listener)));
+                        if let Some(core) = core_weak.upgrade()
+                            && let Ok(seq) = core.sync(0)
+                        {
+                            resync_seq.set(Some(seq.seq()));
+                        }
+                    }
+                }
+                // Clients (#8): `pipewire.sec.pid` is set on the client by the protocol, and an
+                // app stream node reaches it through its `client.id`. The registry global
+                // carries part of the client's properties; bind it for the rest
+                // (`application.process.id`, which the client may set after connecting) and
+                // for every later change.
+                ObjectType::Client => {
+                    let mut client_props = dict_to_vec(props);
+                    client_props.push((REGISTRY_CLIENT_KEY.to_owned(), "true".to_owned()));
+                    add_shared.apply(RegistryEvent::Added {
+                        id: obj.id,
+                        props: client_props,
+                    });
+                    if let Some(registry) = registry_weak.upgrade()
+                        && let Ok(client) = registry.bind::<Client, _>(obj)
+                    {
+                        let id = obj.id;
+                        let info_shared = Arc::clone(&add_shared);
+                        let listener = client
+                            .add_listener_local()
+                            .info(move |info| {
+                                if let Some(p) = info.props() {
+                                    info_shared.apply(RegistryEvent::Updated {
+                                        id,
+                                        props: dict_to_vec(p),
+                                    });
+                                }
+                            })
+                            .register();
+                        add_clients
+                            .borrow_mut()
+                            .insert(id, (client, Box::new(listener)));
                         if let Some(core) = core_weak.upgrade()
                             && let Ok(seq) = core.sync(0)
                         {
@@ -799,6 +1167,17 @@ fn loop_thread(
         })
         .global_remove(move |id| {
             rm_nodes.borrow_mut().remove(&id);
+            rm_clients.borrow_mut().remove(&id);
+            // A stream capture whose target this was is shut and unlinked here, on the loop
+            // thread, as the removal arrives: before the table changes and before the session
+            // manager could link the capture to anything else. Its supervisor sees the same
+            // removal in the table and says so too; neither ever reconnects it.
+            let gone_serial = rm_shared.lock().stream_metadata(id).and_then(|m| m.serial);
+            if let Some(serial) = gone_serial {
+                for s in rm_app_streams.borrow_mut().values_mut() {
+                    s.target_removed(serial);
+                }
+            }
             rm_shared.apply(RegistryEvent::Removed(id));
         })
         .register();
@@ -822,9 +1201,11 @@ fn loop_thread(
     mics.borrow_mut().clear();
     vmics.borrow_mut().clear();
     playbacks.borrow_mut().clear();
+    app_streams.borrow_mut().clear();
     drop(_commands);
     drop(_registry_listener);
     drop(nodes);
+    drop(clients);
     drop(holders);
     drop(_core_listener);
 }
@@ -1117,6 +1498,327 @@ mod tests {
         assert_eq!(parse_rate("48000"), Some(48_000));
         assert_eq!(parse_rate(" \"48000\" "), Some(48_000));
         assert_eq!(parse_rate("fast"), None);
+    }
+
+    fn updated(id: u32, props: &[(&str, &str)]) -> RegistryEvent {
+        RegistryEvent::Updated {
+            id,
+            props: props
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        }
+    }
+
+    /// A client global as the loop thread reports it: its registry properties plus the marker.
+    fn client(id: u32, props: &[(&str, &str)]) -> RegistryEvent {
+        let mut all = props.to_vec();
+        all.push((REGISTRY_CLIENT_KEY, "true"));
+        added(id, &all)
+    }
+
+    fn stream_node(id: u32, extra: &[(&str, &str)]) -> RegistryEvent {
+        let mut all = vec![
+            ("media.class", "Stream/Output/Audio"),
+            ("node.name", "app.out"),
+        ];
+        all.extend_from_slice(extra);
+        added(id, &all)
+    }
+
+    // Property keys the metadata tests use, short so each event fits on a line.
+    const CID: &str = "client.id";
+    const PID: &str = "application.process.id";
+    const SEC: &str = "pipewire.sec.pid";
+    const NAME: &str = "application.name";
+    const SERIAL: &str = "object.serial";
+
+    #[test]
+    fn stream_metadata_reads_pids_from_the_node_and_from_its_client_in_either_order() {
+        // (what, events, expected (process id, origin), expected (sec pid, origin)).
+        type Case = (
+            &'static str,
+            Vec<RegistryEvent>,
+            (Option<u32>, Option<PropertyOrigin>),
+            Option<u32>,
+        );
+        use PropertyOrigin::{Client as C, Node as N};
+        let cases: Vec<Case> = vec![
+            (
+                "neither on the node nor on a client",
+                vec![stream_node(10, &[(SERIAL, "110")])],
+                (None, None),
+                None,
+            ),
+            (
+                "native: node then client, sec pid only on the client",
+                vec![
+                    stream_node(10, &[(CID, "3"), (PID, "4242")]),
+                    client(3, &[(SEC, "4242")]),
+                ],
+                (Some(4242), Some(N)),
+                Some(4242),
+            ),
+            (
+                "client first, then its node",
+                vec![client(3, &[(SEC, "4242")]), stream_node(10, &[(CID, "3")])],
+                (None, None),
+                Some(4242),
+            ),
+            (
+                "pulse: the app's pid differs from pipewire-pulse's sec pid",
+                vec![
+                    client(7, &[(SEC, "900"), (PID, "5150")]),
+                    stream_node(11, &[(CID, "7")]),
+                ],
+                (Some(5150), Some(C)),
+                Some(900),
+            ),
+            (
+                "forged node sec pid never overrides the owning client's",
+                vec![
+                    client(7, &[(SEC, "900")]),
+                    stream_node(11, &[(CID, "7"), (SEC, "42"), (PID, "43")]),
+                ],
+                (Some(43), Some(N)),
+                Some(900),
+            ),
+            (
+                "forged node sec pid via a later update still loses",
+                vec![
+                    client(7, &[(SEC, "900")]),
+                    stream_node(11, &[(CID, "7")]),
+                    updated(11, &[(SEC, "42")]),
+                ],
+                (None, None),
+                Some(900),
+            ),
+            (
+                "node-only sec pid with no client at all is not trusted",
+                vec![stream_node(11, &[(SEC, "42")])],
+                (None, None),
+                None,
+            ),
+            (
+                "node-only sec pid whose client is not known is not trusted",
+                vec![stream_node(11, &[(CID, "7"), (SEC, "42")])],
+                (None, None),
+                None,
+            ),
+            (
+                "pids arrive with the bound node's and client's info",
+                vec![
+                    stream_node(12, &[]),
+                    updated(12, &[(CID, "8"), (PID, "77")]),
+                    client(8, &[]),
+                    updated(8, &[(SEC, "78")]),
+                ],
+                (Some(77), Some(N)),
+                Some(78),
+            ),
+            (
+                "unparseable and zero pids are none",
+                vec![
+                    stream_node(13, &[(PID, "abc"), (SEC, "0")]),
+                    stream_node(14, &[(CID, "9")]),
+                    client(9, &[(SEC, "0"), (PID, "x")]),
+                ],
+                (None, None),
+                None,
+            ),
+        ];
+        for (what, events, pid, sec) in cases {
+            let mut t = NodeTable::default();
+            for e in events {
+                t.apply(e);
+            }
+            let id = t.streams().next().map(|s| s.id).expect(what);
+            let m = t.stream_metadata(id).expect(what);
+            assert_eq!(
+                (m.application_process_id, m.application_process_id_origin),
+                pid,
+                "{what}"
+            );
+            assert_eq!(m.sec_pid, sec, "{what}");
+        }
+    }
+
+    #[test]
+    fn client_arrival_change_and_removal_bump_the_generation_only_when_a_stream_sees_it() {
+        let mut t = NodeTable::default();
+        // A client no stream points at: tracked, but nothing observable changed.
+        assert!(!t.apply(client(3, &[(SEC, "10")])));
+        assert!(t.apply(stream_node(20, &[(CID, "3")])));
+        assert_eq!(t.stream_metadata(20).unwrap().sec_pid, Some(10));
+        // The client's info arrives with the app's own pid: the stream reflects it.
+        let g = t.generation;
+        assert!(t.apply(updated(3, &[(SEC, "10"), (PID, "11")])));
+        assert_eq!(t.generation, g + 1);
+        let m = t.stream_metadata(20).unwrap();
+        assert_eq!(m.application_process_id, Some(11));
+        // The same info again is no change.
+        assert!(!t.apply(updated(3, &[(PID, "11")])));
+        assert_eq!(t.generation, g + 1);
+        // A client added after its node makes the change visible too.
+        assert!(t.apply(stream_node(21, &[(CID, "4")])));
+        assert!(t.apply(client(4, &[(SEC, "12")])));
+        assert_eq!(t.stream_metadata(21).unwrap().sec_pid, Some(12));
+        // The client goes: what it gave goes with it, and that is a change.
+        let g = t.generation;
+        assert!(t.apply(RegistryEvent::Removed(3)));
+        assert_eq!(t.generation, g + 1);
+        let m = t.stream_metadata(20).unwrap();
+        assert_eq!((m.sec_pid, m.application_process_id), (None, None));
+        assert_eq!(m.client_id, Some(3), "the node still names it");
+        assert!(!t.apply(RegistryEvent::Removed(3)), "already gone");
+        // The node goes: no metadata for it any more, the other is untouched.
+        assert!(t.apply(RegistryEvent::Removed(21)));
+        assert!(t.stream_metadata(21).is_none());
+        assert!(t.stream_metadata(20).is_some());
+        // A client is never listed as a stream, source or sink.
+        assert_eq!(t.streams().count(), 1);
+        assert_eq!(t.sources().count() + t.sinks().count(), 0);
+    }
+
+    #[test]
+    fn explicit_empty_invalid_or_zero_values_clear_and_notify_but_absent_keys_preserve() {
+        use PropertyOrigin::{Client as C, Node as N};
+        let mut t = NodeTable::default();
+        t.apply(client(3, &[(SEC, "900"), (PID, "901")]));
+        t.apply(stream_node(
+            10,
+            &[(CID, "3"), (PID, "43"), (NAME, "player"), (SERIAL, "110")],
+        ));
+        let m = t.stream_metadata(10).unwrap();
+        assert_eq!(m.sec_pid, Some(900));
+        assert_eq!(
+            (m.application_process_id, m.application_process_id_origin),
+            (Some(43), Some(N))
+        );
+        assert_eq!(m.application_name.as_deref(), Some("player"));
+        assert_eq!(m.client_id, Some(3));
+
+        // A partial update naming none of those keys preserves everything and is no change.
+        let g = t.generation;
+        assert!(!t.apply(updated(10, &[("node.latency", "1/48000")])));
+        assert!(!t.apply(updated(3, &[("application.name", "c")])));
+        assert_eq!(t.generation, g);
+        let m = t.stream_metadata(10).unwrap();
+        assert_eq!(
+            (m.sec_pid, m.application_process_id, m.client_id),
+            (Some(900), Some(43), Some(3))
+        );
+
+        // Node application.process.id cleared: falls back to the client's, with its origin.
+        for bad in ["", "0", "junk", " "] {
+            let mut t = t.clone();
+            let g = t.generation;
+            assert!(t.apply(updated(10, &[(PID, bad)])), "pid {bad:?}");
+            assert_eq!(t.generation, g + 1);
+            let m = t.stream_metadata(10).unwrap();
+            assert_eq!(
+                (m.application_process_id, m.application_process_id_origin),
+                (Some(901), Some(C)),
+                "pid {bad:?}"
+            );
+            // The same clear again is not a change.
+            assert!(!t.apply(updated(10, &[(PID, bad)])));
+        }
+        // Name cleared.
+        for bad in ["", "   "] {
+            let mut t = t.clone();
+            assert!(t.apply(updated(10, &[(NAME, bad)])), "name {bad:?}");
+            assert_eq!(t.stream_metadata(10).unwrap().application_name, None);
+        }
+        // client.id cleared: the stream loses its client, and with it the security pid.
+        for bad in ["", "0x", "-1"] {
+            let mut t = t.clone();
+            assert!(t.apply(updated(10, &[(CID, bad)])), "client {bad:?}");
+            let m = t.stream_metadata(10).unwrap();
+            assert_eq!((m.client_id, m.sec_pid), (None, None), "client {bad:?}");
+        }
+        // Client keys cleared: its sec pid and claimed pid go, observers are notified.
+        for bad in ["", "0", "junk"] {
+            let mut t = t.clone();
+            let g = t.generation;
+            assert!(t.apply(updated(3, &[(SEC, bad)])), "sec {bad:?}");
+            assert_eq!(t.generation, g + 1);
+            assert_eq!(t.stream_metadata(10).unwrap().sec_pid, None);
+            assert!(t.apply(updated(3, &[(PID, bad)])), "client pid {bad:?}");
+            let m = t.stream_metadata(10).unwrap();
+            // Only the node's own claim is left, with its origin.
+            assert_eq!(
+                (m.application_process_id, m.application_process_id_origin),
+                (Some(43), Some(N))
+            );
+        }
+        // Clearing one key leaves the other keys of the same update untouched.
+        let mut t2 = t.clone();
+        assert!(t2.apply(updated(3, &[(SEC, "")])));
+        assert_eq!(
+            t2.stream_metadata(10).unwrap().application_process_id,
+            Some(43)
+        );
+        assert_eq!(
+            t2.stream_metadata(10).unwrap().application_name.as_deref(),
+            Some("player")
+        );
+    }
+
+    #[test]
+    fn a_stream_says_whether_application_name_was_really_set() {
+        let mut t = NodeTable::default();
+        t.apply(stream_node(
+            30,
+            &[(NAME, "Firefox"), (SERIAL, "130"), (CID, "5")],
+        ));
+        t.apply(stream_node(31, &[("application.process.binary", "mpv")]));
+        t.apply(stream_node(32, &[]));
+        t.apply(stream_node(33, &[(NAME, "  ")]));
+        fn by_id(t: &NodeTable, id: u32) -> StreamMetadata {
+            t.stream_metadata(id).unwrap()
+        }
+        assert_eq!(by_id(&t, 30).application_name.as_deref(), Some("Firefox"));
+        assert_eq!(by_id(&t, 30).serial, Some(130));
+        assert_eq!(by_id(&t, 30).client_id, Some(5));
+        // The fallbacks AppStream shows are not names.
+        let apps: Vec<_> = t.streams().map(|s| s.application.as_str()).collect();
+        assert_eq!(apps, ["Firefox", "mpv", "unknown", "  "]);
+        assert_eq!(by_id(&t, 31).application_name, None);
+        assert_eq!(by_id(&t, 32).application_name, None);
+        assert_eq!(by_id(&t, 33).application_name, None, "blank is not a name");
+        // The name arrives later with the node's info: now it is set.
+        assert!(t.apply(updated(31, &[(NAME, "mpv")])));
+        assert_eq!(by_id(&t, 31).application_name.as_deref(), Some("mpv"));
+        // An unknown id has no metadata; the iterator pairs each stream with its own.
+        assert!(t.stream_metadata(99).is_none());
+        assert!(t.streams_with_metadata().all(|(s, m)| s.id == m.id));
+        assert_eq!(t.streams_with_metadata().count(), 4);
+    }
+
+    #[test]
+    fn stream_by_serial_finds_only_app_streams() {
+        let mut t = NodeTable::default();
+        t.apply(stream_node(40, &[(SERIAL, "140")]));
+        t.apply(added(
+            41,
+            &[
+                ("media.class", "Audio/Sink"),
+                ("node.name", "speakers"),
+                (SERIAL, "141"),
+            ],
+        ));
+        assert_eq!(t.stream_by_serial(140).map(|s| s.id), Some(40));
+        assert!(
+            t.stream_by_serial(141).is_none(),
+            "a sink is not an app stream"
+        );
+        assert!(t.stream_by_serial(142).is_none());
+        assert!(t.node_named("speakers", 40));
+        assert!(
+            !t.node_named("app.out", 40),
+            "the stream itself does not count"
+        );
     }
 
     /// Needs a running PipeWire server: `just probe`.
