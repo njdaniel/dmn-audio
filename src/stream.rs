@@ -513,11 +513,18 @@ impl StreamStatus {
     /// anything else becomes `Idle`. Only then is the closure published. A terminal error
     /// reported later still sets `Error`.
     fn loop_ended(&self) {
-        let _ = self
-            .state
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |s| {
-                (s != CaptureState::Error.to_u8()).then_some(CaptureState::Idle.to_u8())
-            });
+        let mut current = self.state.load(Ordering::Acquire);
+        while current != CaptureState::Error.to_u8() {
+            match self.state.compare_exchange(
+                current,
+                CaptureState::Idle.to_u8(),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
+        }
         self.closed.store(true, Ordering::Release);
     }
 
