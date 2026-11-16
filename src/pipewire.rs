@@ -968,7 +968,7 @@ fn loop_thread(
                 Ok(s) => {
                     cmd_app_streams.borrow_mut().insert(key, s);
                 }
-                Err(e) => status.stream_error(e),
+                Err(e) => status.open_failed(e),
             }
         }
         Command::ConnectStream { key, serial } => {

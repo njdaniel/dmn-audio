@@ -274,6 +274,11 @@ pub struct StreamStatus {
     /// Set for good when a terminal error was reported; shuts the delivery gate and keeps the
     /// error from being hidden by later state events. Cleared only by a new start.
     failed: AtomicBool,
+    /// Set when the loop thread has closed the stream (its `LoopStream` dropped, or it was never
+    /// created), whatever the visible state says. `StreamCapture::stop` waits for this, not
+    /// for `Idle`, so a standing terminal `Error` does not look like a failed cleanup. Cleared
+    /// by a new start.
+    closed: AtomicBool,
     pushed: AtomicU64,
     dropped: AtomicU64,
     last_error: Mutex<Option<String>>,
@@ -397,6 +402,7 @@ impl StreamStatus {
         self.dropped.store(0, Ordering::Relaxed);
         self.target_gone.store(false, Ordering::Release);
         self.failed.store(false, Ordering::Release);
+        self.closed.store(false, Ordering::Release);
         self.clear_error();
         self.connection_reset();
         // A previous run's `Error` or `Disconnected` must not be mistaken for this one's.
@@ -502,14 +508,49 @@ impl StreamStatus {
         }
     }
 
-    /// Why nothing is being delivered, when the reason is final and not a wait.
+    /// The loop dropped the stream (or never made one). A standing `Error` is kept: the swap is
+    /// one compare-exchange loop, so an `Error` arriving concurrently is never overwritten;
+    /// anything else becomes `Idle`. Only then is the closure published. A terminal error
+    /// reported later still sets `Error`.
+    fn loop_ended(&self) {
+        let _ = self
+            .state
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |s| {
+                (s != CaptureState::Error.to_u8()).then_some(CaptureState::Idle.to_u8())
+            });
+        self.closed.store(true, Ordering::Release);
+    }
+
+    /// Opening the stream failed on the loop thread: report why and acknowledge that there is
+    /// nothing to close (no `LoopStream` exists to drop).
+    pub(crate) fn open_failed(&self, why: String) {
+        self.stream_error(why);
+        self.closed.store(true, Ordering::Release);
+    }
+
+    /// Wait (at most `timeout`) for the loop's closure acknowledgment. Once acknowledged, the
+    /// owner's explicit stop makes the state `Idle`; the terminal cause stays readable through
+    /// `failure()`. Returns the state at the end; `Idle` means closed.
+    fn wait_closed(&self, timeout: Duration) -> CaptureState {
+        let t = Instant::now();
+        while !self.closed.load(Ordering::Acquire) && t.elapsed() < timeout {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        if self.closed.load(Ordering::Acquire) {
+            self.set_state(CaptureState::Idle);
+        }
+        self.state()
+    }
+
+    /// Why nothing is being delivered, when the reason is final and not a wait. A terminal
+    /// error counts whatever the state became afterwards (teardown sets `Idle`).
     fn failure(&self) -> Option<StreamError> {
         if self.target_gone() {
             return Some(StreamError::TargetGone {
                 serial: self.serial(),
             });
         }
-        if self.state() != CaptureState::Error {
+        if self.state() != CaptureState::Error && !self.failed() {
             return None;
         }
         let why = self.last_error().unwrap_or_default();
@@ -699,6 +740,15 @@ fn stream_process(stream: &pw::stream::Stream, inlet: &mut Inlet) {
     deliver(inlet, &bytes[start..end]);
 }
 
+/// A final-field guard: acknowledge closure only after the listeners and stream are destroyed.
+struct CloseAck(Arc<StreamStatus>);
+
+impl Drop for CloseAck {
+    fn drop(&mut self) {
+        self.0.loop_ended();
+    }
+}
+
 /// The stream and its two listeners, owned by the PipeWire loop thread, as `LoopMic` is.
 pub(crate) struct LoopStream {
     // Field order is drop order: listeners before the stream they are attached to.
@@ -709,6 +759,8 @@ pub(crate) struct LoopStream {
     connected: bool,
     /// Set once the target is gone: this stream is never connected again.
     retired: bool,
+    // Must remain last: Rust drops fields in declaration order.
+    _close_ack: CloseAck,
 }
 
 impl LoopStream {
@@ -777,6 +829,7 @@ impl LoopStream {
             .register()
             .map_err(|e| e.to_string())?;
 
+        let close_ack = CloseAck(Arc::clone(&spec.status));
         Ok(Self {
             _process: process_listener,
             _events: events_listener,
@@ -784,6 +837,7 @@ impl LoopStream {
             status: spec.status,
             connected: false,
             retired: false,
+            _close_ack: close_ack,
         })
     }
 
@@ -840,8 +894,9 @@ impl LoopStream {
     }
 
     /// The capture is over (the supervisor's `DisconnectStream`): unlink for good. The state
-    /// becomes `Disconnected` unless an error stands: a refusal, a lost server or a format
-    /// rejection keeps its reason for [`StreamCapture::wait_streaming`].
+    /// becomes `Disconnected` unless an error stands: a refusal or a lost server keeps its
+    /// reason for [`StreamCapture::wait_streaming`]. A format rejection's typed reason is not
+    /// kept for sure: unlinking resets the negotiation, so it may read as a plain `Stream` error.
     pub(crate) fn disconnect(&mut self) {
         self.retired = true;
         self.unlink();
@@ -871,7 +926,7 @@ impl Drop for LoopStream {
     fn drop(&mut self) {
         // Destroying the stream (the fields drop after this) removes the node from the graph.
         self.unlink();
-        self.status.set_state(CaptureState::Idle);
+        // The final field acknowledges closure after the listeners and stream drop.
     }
 }
 
@@ -1064,7 +1119,8 @@ impl StreamCapture {
     /// [`StreamError::UnknownSerial`] when no app stream has the serial (a sink's or source's
     /// serial included), [`StreamError::AmbiguousSerial`] when a node is named like it, and
     /// [`StreamError::Disconnected`] when the server is gone. Calling it while started is an
-    /// error. After [`Self::stop`] it may be called again: a new capture with a new ring.
+    /// error. After a successful [`Self::stop`] it may be called again: a new capture with a
+    /// new ring. A timed-out stop must be retried to acknowledge closure before restarting.
     pub fn start(&mut self) -> Result<StreamReader, StreamError> {
         if self.key.is_some() {
             return Err(AudioError::AlreadyStarted.into());
@@ -1173,17 +1229,21 @@ impl StreamCapture {
             .map(|h| h.join().is_err())
             .unwrap_or(false);
         let mut final_state = None;
-        if let Some(key) = self.key.take()
+        if let Some(key) = self.key
             && self.ctx.send(Command::CloseStream { key }).is_ok()
         {
-            let t = Instant::now();
-            while self.status.state() != CaptureState::Idle && t.elapsed() < STOP_TIMEOUT {
-                std::thread::sleep(Duration::from_millis(2));
-            }
             // Never claim a clean stop we did not get: the caller may be about to drop the ring.
-            final_state = Some(self.status.state());
+            final_state = Some(self.status.wait_closed(STOP_TIMEOUT));
+        } else if self.status.closed.load(Ordering::Acquire) {
+            // The loop is gone but had already acknowledged the closure: nothing is live.
+            self.status.set_state(CaptureState::Idle);
         }
-        stop_result(panicked, final_state, STOP_TIMEOUT)
+        let result = stop_result(panicked, final_state, STOP_TIMEOUT);
+        // Keep the old key after a timeout: its eventual drop must not acknowledge a new run.
+        if result.is_ok() {
+            self.key = None;
+        }
+        result
     }
 }
 
@@ -1732,6 +1792,75 @@ mod tests {
         st.format_settled(48_000, 2, AudioFormat::F32LE);
         assert_eq!(st.delivered_format(), None);
         assert_eq!(st.state(), CaptureState::Error);
+    }
+
+    /// Server loss: the supervisor's error and the loop's teardown race, in either order. An
+    /// unexpected teardown never hides the error; an explicit stop still reaches `Idle`, and
+    /// the terminal cause stays readable through `failure()`.
+    #[test]
+    fn server_loss_error_and_teardown_agree_in_either_order() {
+        let short = Duration::from_millis(20);
+        for error_first in [true, false] {
+            let st = status(48_000, 2);
+            st.stream_streaming();
+            assert!(!st.closed.load(Ordering::Acquire));
+            if error_first {
+                st.stream_error("PipeWire server went away".into());
+                st.loop_ended();
+            } else {
+                st.loop_ended();
+                st.stream_error("PipeWire server went away".into());
+            }
+            // Unexpected teardown: the error stays visible, closure is acknowledged apart.
+            assert_eq!(st.state(), CaptureState::Error);
+            assert!(st.closed.load(Ordering::Acquire));
+            assert_eq!(st.failure().as_ref().map(kind), Some("other"));
+            // Stop after the loop ended: Idle, and the cause is still reported.
+            assert_eq!(st.wait_closed(short), CaptureState::Idle);
+            assert_eq!(st.failure().as_ref().map(kind), Some("other"));
+            assert_eq!(
+                st.last_error().as_deref(),
+                Some("PipeWire server went away")
+            );
+        }
+
+        // Stop before the loop ends: no acknowledgment times out; a later one is awaited.
+        let st = status(48_000, 2);
+        st.stream_error("lost".into());
+        assert_eq!(st.wait_closed(short), CaptureState::Error);
+        assert!(!st.closed.load(Ordering::Acquire));
+        let st2 = Arc::clone(&st);
+        let ender = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            st2.loop_ended();
+        });
+        assert_eq!(st.wait_closed(Duration::from_secs(5)), CaptureState::Idle);
+        ender.join().unwrap();
+        assert!(st.failure().is_some());
+
+        // A clean explicit stop is Idle with no failure.
+        let st = status(48_000, 2);
+        st.stream_streaming();
+        st.loop_ended();
+        assert_eq!(st.wait_closed(short), CaptureState::Idle);
+        assert!(st.failure().is_none());
+
+        // A failed open has no stream to drop: it reports and acknowledges closure itself.
+        let st = status(48_000, 2);
+        st.open_failed("cannot create stream".into());
+        assert_eq!(st.state(), CaptureState::Error);
+        assert!(st.closed.load(Ordering::Acquire));
+        assert_eq!(st.wait_closed(short), CaptureState::Idle);
+        assert_eq!(st.failure().as_ref().map(kind), Some("other"));
+
+        // A restart resets the acknowledgment and the failure.
+        st.restart();
+        assert!(!st.closed.load(Ordering::Acquire));
+        assert!(st.failure().is_none());
+        st.stream_error("again".into());
+        st.loop_ended();
+        assert_eq!(st.state(), CaptureState::Error);
+        assert!(st.closed.load(Ordering::Acquire));
     }
 
     /// The loop thread revalidates with `resolve_serial` right before it connects, so a name

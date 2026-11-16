@@ -13,7 +13,7 @@ use std::error::Error;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use dmn_audio::{CaptureState, PipeWireContext, StreamCapture, StreamError};
+use dmn_audio::{PipeWireContext, StreamCapture, StreamError};
 
 const RATE: u32 = 48_000;
 
@@ -71,9 +71,13 @@ fn run() -> Result<(), Box<dyn Error>> {
             out.write_sample(*s)?;
         }
         samples += n as u64;
-        if status.target_gone() || status.state() == CaptureState::Error {
-            ended = capture.wait_streaming(Duration::ZERO).err();
-            break;
+        // A terminal failure is reported whatever state teardown left behind.
+        match capture.wait_streaming(Duration::ZERO) {
+            Err(StreamError::NotStreaming { .. }) | Ok(()) => {}
+            Err(e) => {
+                ended = Some(e);
+                break;
+            }
         }
         std::thread::sleep(Duration::from_millis(10));
     }
